@@ -1,0 +1,15 @@
+{
+  "name": "gencull",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Find duplicate and reference images in ChatGPT storage, cull failed generations, and free up your quota.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js",
+    "test:e2e": "npm run build && node --test test/e2e/*.test.mjs",
+    "mock": "node test/e2e/mock-server.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.56.1"
+  }
+}
