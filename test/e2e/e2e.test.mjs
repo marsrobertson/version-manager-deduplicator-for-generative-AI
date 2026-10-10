@@ -179,3 +179,23 @@ test('no generated-images history: bulk reference removal stays locked, copies k
     assert.deepEqual(t.errors, []);
   } finally { await t.done(); }
 });
+
+test('autopilot: one click removes copies and references, verifies, never touches generations', async () => {
+  const t = await setup('known');
+  const { page } = t;
+  try {
+    let dialog = '';
+    page.on('dialog', d => { dialog = d.message(); d.accept(); });
+    await page.goto(t.mock.url);
+    await tid(page, 'gc-launcher').click();
+    await tid(page, 'gc-dryrun').uncheck();
+    await tid(page, 'gc-autopilot').click();
+    await page.waitForFunction(() => /Autopilot done/.test(document.querySelector('#gencull-host').shadowRoot.querySelector('[data-testid=gc-status]')?.textContent || ''), null, { timeout: 60000 });
+    assert.match(dialog, /delete 13 files/);
+    const s = await t.state();
+    assert.equal(s.files.length, 21);
+    assert.equal(s.files.filter(f => f.kind === 'generation').length, 20);
+    assert.ok(s.files.some(f => f.name === 'notes.pdf'));
+    assert.deepEqual(t.errors, []);
+  } finally { await t.done(); }
+});

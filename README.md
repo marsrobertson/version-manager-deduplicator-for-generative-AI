@@ -35,6 +35,18 @@ The storage page lets you delete one file at a time. With 10,000 images, that is
 
 ![Culling a series on test data](docs/screenshot-series.png)
 
+## Autopilot (least effort)
+
+Untick **Dry run** and press **Autopilot: remove copies & references**. It runs entirely in your browser and needs no Claude tokens:
+
+1. Scans your storage.
+2. Queues only the safe deletions: extra copies, plus uploaded reference images when the upload/generation split is certain.
+3. Shows one confirmation with the counts, then downloads the list of files.
+4. Deletes one test file and re-reads the storage listing to prove it is gone. If it is still listed, autopilot pauses.
+5. Deletes the rest, then rescans and reports the space freed.
+
+Autopilot **never deletes generations**. Culling generations needs your judgement, so it stays manual (Series tab). With dry run on, autopilot only simulates.
+
 ## Install
 
 GenCull is a *userscript*: a small program that runs inside the chatgpt.com tab, with your existing login. It talks only to chatgpt.com.
@@ -137,7 +149,7 @@ I could not log in to a real ChatGPT account while building this. These points a
 ```bash
 npm install           # installs playwright-core (for the browser tests only)
 npm test              # 19 unit tests: parsing, classification, duplicates, dHash, request learning
-npm run test:e2e      # builds, then runs 3 browser tests in Chromium against a fake ChatGPT
+npm run test:e2e      # builds, then runs 4 browser tests in Chromium against a fake ChatGPT
 npm run mock -- learn # run the fake ChatGPT at http://127.0.0.1:8787 (modes: known, learn, nogen)
 ```
 
@@ -145,6 +157,7 @@ The browser tests cover:
 - **known:** the reported endpoints.
 - **learn:** the reported endpoints are gone, and GenCull must learn unusual ones (`page_token` paging, `DELETE /library/v2/items/:id`) by watching the fake storage page.
 - **nogen:** no generated-images history, so bulk reference removal must stay locked and copy removal must keep the original generation.
+- **autopilot:** one click removes copies and references, verifies the test delete, and leaves every generation and the PDF alone.
 
 ## Code layout
 

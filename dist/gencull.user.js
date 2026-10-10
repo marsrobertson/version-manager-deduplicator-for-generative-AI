@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GenCull: ChatGPT storage deduplicator
 // @namespace    https://github.com/marsrobertson/version-manager-deduplicator-for-generative-AI
-// @version      0.1.0
+// @version      0.2.0
 // @description  Find repeat uploads and reference images in ChatGPT storage, cull failed generations, free up your quota. Runs locally in your ChatGPT tab.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -1250,7 +1250,7 @@ const GCNet = (() => {
 const GCApp = (() => {
   'use strict';
   const C = GCCore, N = GCNet, S = GCStore;
-  const VERSION = '0.1.0';
+  const VERSION = '0.2.0';
   const fmt = C.formatBytes;
   const num = n => Number(n || 0).toLocaleString();
 
@@ -1639,6 +1639,56 @@ const GCApp = (() => {
     render();
   }
 
+  // ----------------------------------------------------------- autopilot ----
+
+  /**
+   * One click: scan, queue the safe deletions (extra copies, and uploaded
+   * reference images when the split is certain), delete one test file,
+   * re-read the storage listing to prove it is really gone, then delete the
+   * rest and rescan. Generations are never touched; culling needs your eye.
+   */
+  async function autopilot() {
+    if (st.scanning || st.del?.phase === 'running') return;
+    st.open = true;
+    await scan();
+    if (!st.scannedAt || st.libInfo?.needsTeaching) { log('Autopilot stopped: storage listing not found. See Setup.'); return; }
+    const extras = new Set(C.planExtraCopies(st.groups));
+    const refs = st.cls?.trustAbsence ? C.planAllReferences(st.items) : [];
+    const keys = [...new Set([...extras, ...refs])].filter(k => markOf(k) !== 'keep');
+    if (!keys.length) { log('Autopilot: nothing safe to delete automatically.'); status('Autopilot: nothing safe to delete.'); return; }
+    const bytes = keys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
+    const msg = `GenCull autopilot\n\n${st.dryRun ? 'DRY RUN (nothing is sent): ' : ''}delete ${num(keys.length)} files, ${fmt(bytes)}:\n` +
+      `• ${num(extras.size)} extra copies (one copy of each file is kept)\n` +
+      `• ${st.cls?.trustAbsence ? `${num(refs.length)} uploaded reference images` : 'reference uploads skipped: upload/generation split is uncertain'}\n\n` +
+      'Generations are not touched. A list of the files downloads first, and one test file is deleted and verified before the rest.\n\nContinue?';
+    if (!window.confirm(msg)) { log('Autopilot cancelled.'); return; }
+    setMark([...extras], 'reject', 'extra copy');
+    setMark(refs.filter(k => !extras.has(k)), 'reject', 'reference upload');
+    startDelete();
+    const d = st.del;
+    d.typed = 'delete';
+    await deleteCanary();
+    if (st.dryRun || d.phase !== 'canary-ok') return;
+    status('Autopilot: checking the test file is really gone…');
+    let stillListed = true;
+    try {
+      const again = await N.listLibrary({ onPage: p => status(`Autopilot: verifying (${num(p.total)} files read)`) });
+      stillListed = again.items.some(it => it.key === d.canary.item.key);
+    } catch (e) { log(`Autopilot: verification failed (${e.message || e}).`); }
+    if (stillListed) {
+      log('Autopilot paused: ChatGPT accepted the test delete but still lists the file. Check Settings → Storage, then press Continue in the Queue tab if it is gone there.');
+      status('Autopilot paused: test file still listed.');
+      render();
+      return;
+    }
+    log('Autopilot: test file verified gone. Deleting the rest.');
+    await deleteRest();
+    const freed = d.results.filter(r => r.ok).reduce((t, r) => t + (r.item.size || 0), 0);
+    await scan();
+    log(`Autopilot done: freed ${fmt(freed)}.`);
+    status(`Autopilot done: freed ${fmt(freed)}. Next: cull generations in Series (manual).`);
+  }
+
   // -------------------------------------------------------------- render ----
 
   let host, root, drawer, bodyEl, statusEl, logEl, progressEl;
@@ -1723,7 +1773,9 @@ const GCApp = (() => {
       return h('div', { class: 'intro' },
         h('p', {}, 'GenCull reads your ChatGPT storage (the same list you see in Settings → Storage), tells apart the reference images you uploaded from the images ChatGPT generated, finds repeat copies, and helps you cull failed generations.'),
         h('p', {}, 'It runs only in this tab, talks only to chatgpt.com, and deletes nothing without your confirmation. Dry run is on by default.'),
-        st.scanning ? h('p', { class: 'muted' }, 'Scanning…') : btn('Scan my storage', scan, { class: 'primary big', 'data-testid': 'gc-scan-intro' }));
+        st.scanning ? h('p', { class: 'muted' }, 'Scanning…') : btn('Scan my storage', scan, { class: 'big', 'data-testid': 'gc-scan-intro' }),
+        st.scanning ? null : h('div', { class: 'bar' }, btn('Autopilot: remove copies & references', autopilot, { class: 'primary big', disabled: st.scanning || st.del?.phase === 'running', 'data-testid': 'gc-autopilot' }),
+          h('span', { class: 'muted small' }, 'One click. Never touches generations.')));
     }
     const s = st.summary;
     const extras = C.planExtraCopies(st.groups);
@@ -1739,6 +1791,8 @@ const GCApp = (() => {
         tile('Generations', s.generation.n, s.generation.bytes, s.unsized ? `${num(s.unsized)} without size info` : null, 'gc-tile-generation'),
         s.unknown.n ? tile('Unknown', s.unknown.n, s.unknown.bytes, null, 'gc-tile-unknown') : null,
         tile('Extra copies', extras.length, extraBytes, doubtful ? `+${plural(doubtful, 'group needs', 'groups need')} a content check` : null, 'gc-tile-extras')),
+      h('div', { class: 'bar' }, btn('Autopilot: remove copies & references', autopilot, { class: 'primary big', disabled: st.scanning || st.del?.phase === 'running', 'data-testid': 'gc-autopilot' }),
+          h('span', { class: 'muted small' }, 'One click. Never touches generations.')),
       h('h3', {}, 'Suggested steps'),
       h('ol', { class: 'steps' },
         h('li', {}, h('div', {}, h('b', {}, 'Remove repeat copies. '), `Same file uploaded again and again: ${num(extras.length)} extra copies, ${fmt(extraBytes)}. One copy of each is kept.`),
@@ -2103,7 +2157,7 @@ a.link { color: #8ab4ff; }
     if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot, { once: true });
   }
 
-  return { start, st, scan };
+  return { start, st, scan, autopilot };
 })();
 
 // ---- src/main.js ----
