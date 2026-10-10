@@ -55,10 +55,18 @@ const GCApp = (() => {
 
   function log(msg) {
     st.log.push(`${new Date().toLocaleTimeString()}  ${msg}`);
+    console.info('%c[GenCull]', 'color:#8ab4ff;font-weight:bold', msg);
     if (st.log.length > 300) st.log.shift();
     if (logEl) { logEl.textContent = st.log.slice(-60).join('\n'); logEl.scrollTop = logEl.scrollHeight; }
   }
-  function status(msg) { if (statusEl) statusEl.textContent = msg || ''; }
+  function status(msg) {
+    if (statusEl) statusEl.textContent = msg || '';
+    if (toastEl && msg) { toastEl.textContent = `GenCull: ${msg}`; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), busy() ? 60000 : 6000); }
+    updateLauncher();
+  }
+  const busy = () => st.scanning || st.fp.running || st.del?.phase === 'running' || st.auto;
+  function updateLauncher() { if (launcherEl) launcherEl.textContent = busy() ? '⏳ GenCull working' : 'GenCull'; }
+  let toastEl = null, toastTimer = null, launcherEl = null;
 
   // Marks survive reloads, so a long culling session can be resumed.
   let saveTimer = null;
@@ -403,8 +411,14 @@ const GCApp = (() => {
    * rest and rescan. Generations are never touched; culling needs your eye.
    */
   async function autopilot() {
-    if (st.scanning || st.del?.phase === 'running') return;
+    if (st.scanning || st.del?.phase === 'running' || st.auto) return;
     st.open = true;
+    st.auto = true;
+    try { await runAutopilot(); } finally { st.auto = false; updateLauncher(); render(); }
+  }
+
+  async function runAutopilot() {
+    status('Autopilot started…');
     await scan();
     if (!st.scannedAt || st.libInfo?.needsTeaching) { log('Autopilot stopped: storage listing not found. See Setup.'); return; }
     const extras = new Set(C.planExtraCopies(st.groups));
@@ -459,9 +473,10 @@ const GCApp = (() => {
     } catch {
       root.append(h('style', { text: CSS }));
     }
-    const launcher = h('button', { class: 'launcher', type: 'button', 'data-testid': 'gc-launcher', title: 'GenCull: clean up ChatGPT storage', onclick: () => { st.open = !st.open; render(); } }, 'GenCull');
+    const launcher = launcherEl = h('button', { class: 'launcher', type: 'button', 'data-testid': 'gc-launcher', title: 'GenCull: clean up ChatGPT storage', onclick: () => { st.open = !st.open; render(); } }, 'GenCull');
+    toastEl = h('div', { class: 'toast', 'data-testid': 'gc-toast', onclick: () => { st.open = true; render(); } });
     drawer = h('div', { class: 'drawer', 'data-testid': 'gc-drawer' });
-    root.append(launcher, drawer);
+    root.append(launcher, drawer, toastEl);
     (document.body || document.documentElement).append(host);
     // ChatGPT is a React app and may re-render <body>; put the panel back if it disappears.
     setInterval(() => { if (!host.isConnected) (document.body || document.documentElement).append(host); }, 2000);
@@ -475,6 +490,7 @@ const GCApp = (() => {
   function render() {
     if (!drawer) return;
     drawer.classList.toggle('open', st.open);
+    updateLauncher();
     if (!st.open) return;
     const scrollTop = bodyEl?.scrollTop || 0;
     const tabBefore = drawer.__tab;
@@ -904,11 +920,23 @@ p { margin: 8px 0; }
 .delbox.real { border-color: #8a2b24; background: #211413; }
 .delbox h3 { margin-top: 0; }
 a.link { color: #8ab4ff; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); z-index: 2147483002; max-width: min(560px, 90vw);
+  background: #17181b; color: #e8e8ec; border: 1px solid #3a5bd7; border-radius: 10px; padding: 10px 14px; cursor: pointer;
+  font: 13px/1.4 system-ui, -apple-system, sans-serif; box-shadow: 0 8px 30px rgba(0,0,0,.4); opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 `;
 
   function start() {
     N.install();
-    const boot = () => { mount(); render(); };
+    // Pasted into the console of a loaded page: open right away so you can see it worked.
+    const pasted = document.readyState === 'complete';
+    const boot = () => {
+      mount();
+      if (pasted) st.open = true;
+      render();
+      status(`loaded (v${VERSION}). Click the GenCull tab on the right edge.`);
+      console.info('%cGenCull %s is running. Look for the GenCull tab on the right edge of the page.', 'color:#8ab4ff;font-weight:bold;font-size:14px', VERSION);
+    };
     if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot, { once: true });
   }
 
