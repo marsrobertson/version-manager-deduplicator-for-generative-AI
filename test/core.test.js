@@ -262,3 +262,18 @@ test('formatBytes', () => {
   assert.equal(C.formatBytes(3_500_000), '3.5 MB');
   assert.equal(C.formatBytes(20_000_000_000), '20.0 GB');
 });
+
+test('a history much bigger than storage still proves uploads once matching clearly works', () => {
+  // Real account shape: 23k generations in history, only 5k of them in storage, 2.3k uploads.
+  const lib = [], gen = [];
+  for (let i = 0; i < 50; i++) lib.push(C.normalizeLibraryItem({ id: LID(i), file_id: FID(i), name: `g${i}.png`, size: 100 + i, mime_type: 'image/png' }));
+  for (let i = 50; i < 60; i++) lib.push(C.normalizeLibraryItem({ id: LID(i), file_id: FID(i), name: `paste${i}.png`, size: 100 + i, mime_type: 'image/png' }));
+  for (let i = 0; i < 230; i++) gen.push({ id: `g${i}`, url: `/backend-api/estuary/content?id=${FID(i < 50 ? i : 1000 + i)}` });
+  const m = C.mergeInventory(lib, C.extractGenItems({ items: gen }));
+  const cls = C.classify(m.items, { genComplete: true, genCount: m.genCount, linked: m.linked });
+  assert.ok(cls.linkRate < 0.3);
+  assert.equal(cls.trustAbsence, true);
+  assert.equal(C.planAllReferences(m.items).length, 10);
+  assert.equal(C.summarize(m.items).historyOnly, 180);
+  assert.equal(C.summarize(m.items).total.n, 60);
+});

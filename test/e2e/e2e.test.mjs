@@ -29,6 +29,7 @@ async function setup(mode) {
 }
 
 const tid = (page, id) => page.getByTestId(id);
+async function manual(page) { if (!(await tid(page, 'gc-queue-extras').isVisible())) await tid(page, 'gc-manual').click(); }
 const tileNum = async (page, id) => Number((await tid(page, id).locator('.tnum').textContent()).replace(/\D/g, ''));
 async function scan(page) {
   await tid(page, 'gc-scan').click();
@@ -59,6 +60,7 @@ test('known endpoints: scan, classify, dry run, delete references, cull a series
     await page.screenshot({ path: join(SHOTS, 'overview.png') });
 
     // Dry run: nothing is sent.
+    await manual(page);
     await tid(page, 'gc-queue-extras').click();
     await assert.doesNotReject(tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 8 files' }).waitFor());
     await tid(page, 'gc-delete-open').click();
@@ -71,6 +73,7 @@ test('known endpoints: scan, classify, dry run, delete references, cull a series
     // For real: all uploaded reference images (the PDF must survive).
     await tid(page, 'gc-dryrun').uncheck();
     await tid(page, 'gc-tab-overview').click();
+    await manual(page);
     await tid(page, 'gc-queue-refs').click();
     await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 13 files' }).waitFor();
     const download = page.waitForEvent('download');
@@ -145,6 +148,7 @@ test('learn mode: GenCull learns the listing and the delete from the storage pag
     assert.equal(await tileNum(page, 'gc-tile-extras'), 8);
 
     await tid(page, 'gc-dryrun').uncheck();
+    await manual(page);
     await tid(page, 'gc-queue-extras').click();
     await deleteQueued(page, 8);
     const s = await t.state();
@@ -163,10 +167,13 @@ test('no generated-images history: bulk reference removal stays locked, copies k
     await tid(page, 'gc-launcher').click();
     await scan(page);
     assert.equal(await tileNum(page, 'gc-tile-unknown'), 34);
+    await manual(page);
     assert.ok(await tid(page, 'gc-queue-refs').isDisabled());
+    assert.equal(await tid(page, 'gc-autopilot').count(), 1); // copies are still safe to automate
     await tid(page, 'gc-tab-references').click();
     assert.ok(await tid(page, 'gc-unlock').isVisible());
     await tid(page, 'gc-tab-overview').click();
+    await manual(page);
     await tid(page, 'gc-queue-extras').click();
     await tid(page, 'gc-dryrun').uncheck();
     await deleteQueued(page, 8);

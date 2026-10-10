@@ -288,14 +288,18 @@ const GCCore = (() => {
    *
    * The strongest evidence is membership in the generated-images history.
    * Absence from it only proves "upload" if the history was read to the end
-   * and most of it could be matched to Library entries; otherwise a broken
+   * and id matching visibly works (see below); otherwise a broken
    * id match would make generations look like uploads, which is exactly the
    * mistake a bulk "delete all references" must never make.
    */
   function classify(items, ctx) {
     const { genComplete = false, genCount = 0, linked = 0 } = ctx || {};
     const linkRate = genCount ? linked / genCount : 0;
-    const trustAbsence = genComplete && genCount > 0 && linked > 0 && linkRate >= 0.8;
+    // The history can be far bigger than storage (old generations that never
+    // entered the Library), so a low match rate alone is not a warning sign.
+    // What matters is that the history was read to the end and that id
+    // matching demonstrably works: many matches, or most of a small history.
+    const trustAbsence = genComplete && linked > 0 && (linked >= 20 || linkRate >= 0.8);
     for (const it of items) {
       if (it.inImageGen) {
         Object.assign(it, { kind: 'generation', confidence: 'high', reason: 'in your generated-images history' });
@@ -318,9 +322,11 @@ const GCCore = (() => {
   function summarize(items) {
     const s = {
       total: { n: 0, bytes: 0 }, upload: { n: 0, bytes: 0 }, generation: { n: 0, bytes: 0 },
-      unknown: { n: 0, bytes: 0 }, unsized: 0,
+      unknown: { n: 0, bytes: 0 }, unsized: 0, historyOnly: 0,
     };
     for (const it of items) {
+      // Generations that are only in the history are not in the storage list.
+      if (!it.fromLibrary) { s.historyOnly++; continue; }
       s.total.n++; s.total.bytes += it.size || 0;
       const b = s[it.kind] || s.unknown;
       b.n++; b.bytes += it.size || 0;

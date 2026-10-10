@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GenCull: ChatGPT storage deduplicator
 // @namespace    https://github.com/marsrobertson/version-manager-deduplicator-for-generative-AI
-// @version      0.2.2
+// @version      0.3.0
 // @description  Find repeat uploads and reference images in ChatGPT storage, cull failed generations, free up your quota. Runs locally in your ChatGPT tab.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -305,14 +305,18 @@ const GCCore = (() => {
    *
    * The strongest evidence is membership in the generated-images history.
    * Absence from it only proves "upload" if the history was read to the end
-   * and most of it could be matched to Library entries; otherwise a broken
+   * and id matching visibly works (see below); otherwise a broken
    * id match would make generations look like uploads, which is exactly the
    * mistake a bulk "delete all references" must never make.
    */
   function classify(items, ctx) {
     const { genComplete = false, genCount = 0, linked = 0 } = ctx || {};
     const linkRate = genCount ? linked / genCount : 0;
-    const trustAbsence = genComplete && genCount > 0 && linked > 0 && linkRate >= 0.8;
+    // The history can be far bigger than storage (old generations that never
+    // entered the Library), so a low match rate alone is not a warning sign.
+    // What matters is that the history was read to the end and that id
+    // matching demonstrably works: many matches, or most of a small history.
+    const trustAbsence = genComplete && linked > 0 && (linked >= 20 || linkRate >= 0.8);
     for (const it of items) {
       if (it.inImageGen) {
         Object.assign(it, { kind: 'generation', confidence: 'high', reason: 'in your generated-images history' });
@@ -335,9 +339,11 @@ const GCCore = (() => {
   function summarize(items) {
     const s = {
       total: { n: 0, bytes: 0 }, upload: { n: 0, bytes: 0 }, generation: { n: 0, bytes: 0 },
-      unknown: { n: 0, bytes: 0 }, unsized: 0,
+      unknown: { n: 0, bytes: 0 }, unsized: 0, historyOnly: 0,
     };
     for (const it of items) {
+      // Generations that are only in the history are not in the storage list.
+      if (!it.fromLibrary) { s.historyOnly++; continue; }
       s.total.n++; s.total.bytes += it.size || 0;
       const b = s[it.kind] || s.unknown;
       b.n++; b.bytes += it.size || 0;
@@ -1250,7 +1256,7 @@ const GCNet = (() => {
 const GCApp = (() => {
   'use strict';
   const C = GCCore, N = GCNet, S = GCStore;
-  const VERSION = '0.2.2';
+  const VERSION = '0.3.0';
   const fmt = C.formatBytes;
   const num = n => Number(n || 0).toLocaleString();
 
@@ -1798,33 +1804,41 @@ const GCApp = (() => {
     const s = st.summary;
     const extras = C.planExtraCopies(st.groups);
     const extraBytes = extras.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
+    const certain = st.cls?.trustAbsence;
     const refKeys = C.planAllReferences(st.items, { allowUncertain: st.unlock });
     const refBytes = refKeys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
-    const certain = st.cls?.trustAbsence;
+    const autoKeys = [...new Set([...extras, ...(certain ? C.planAllReferences(st.items) : [])])];
+    const autoBytes = autoKeys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
+    const autoRefs = certain ? C.planAllReferences(st.items).length : 0;
     const doubtful = st.groups.filter(g => !g.confident).length;
     const maybeRefs = st.items.filter(it => it.image && it.fromLibrary && (it.kind === 'upload' || it.kind === 'unknown'));
+    const busy = st.scanning || st.del?.phase === 'running' || st.auto;
     return h('div', {},
+      h('div', { class: 'hero' },
+        h('div', { class: 'herobig', 'data-testid': 'gc-hero' }, autoKeys.length ? `Autopilot can free ${fmt(autoBytes)}` : 'Nothing to delete automatically'),
+        h('div', { class: 'muted' }, autoKeys.length
+          ? `${plural(autoRefs, 'image')} you uploaded or pasted, plus ${plural(extras.length, 'extra copy', 'extra copies')}. Your generations are never touched.`
+          : 'Use Manual tools below to cull generations.'),
+        !certain && maybeRefs.length ? h('div', { class: 'warn' }, `${plural(maybeRefs.length, 'image')} (${fmt(maybeRefs.reduce((t, it) => t + (it.size || 0), 0))}) may be your uploads, but GenCull could not confirm it (${st.genInfo?.error ? 'generated-images history unavailable' : 'too few generations matched'}). Autopilot leaves them alone.`) : null,
+        autoKeys.length ? btn(st.dryRun ? 'Autopilot (dry run: show what it would delete)' : `Autopilot: delete ${num(autoKeys.length)} files`, autopilot, { class: st.dryRun ? 'primary big' : 'danger big', disabled: busy, 'data-testid': 'gc-autopilot' }) : null,
+        autoKeys.length && st.dryRun ? h('div', { class: 'muted small' }, 'Dry run is on (top right). Untick it to delete for real.') : null),
       h('div', { class: 'tiles' },
-        tile('Everything', s.total.n, s.total.bytes, null, 'gc-tile-total'),
-        tile('References (uploads)', s.upload.n, s.upload.bytes, certain ? 'confident' : s.upload.n ? 'uncertain split' : null, 'gc-tile-upload'),
-        tile('Generations', s.generation.n, s.generation.bytes, s.unsized ? `${num(s.unsized)} without size info` : null, 'gc-tile-generation'),
+        tile('In storage', s.total.n, s.total.bytes, null, 'gc-tile-total'),
+        tile('Uploads & pastes', s.upload.n, s.upload.bytes, s.upload.n ? (certain ? 'confident' : 'unconfirmed') : null, 'gc-tile-upload'),
+        tile('Generations', s.generation.n, s.generation.bytes, null, 'gc-tile-generation'),
         s.unknown.n ? tile('Unknown', s.unknown.n, s.unknown.bytes, null, 'gc-tile-unknown') : null,
         tile('Extra copies', extras.length, extraBytes, doubtful ? `+${plural(doubtful, 'group needs', 'groups need')} a content check` : null, 'gc-tile-extras')),
-      h('div', { class: 'bar' }, btn('Autopilot: remove copies & references', autopilot, { class: 'primary big', disabled: st.scanning || st.del?.phase === 'running', 'data-testid': 'gc-autopilot' }),
-          h('span', { class: 'muted small' }, 'One click. Never touches generations.')),
-      h('h3', {}, 'Suggested steps'),
-      h('ol', { class: 'steps' },
-        h('li', {}, h('div', {}, h('b', {}, 'Remove repeat copies. '), `Same file uploaded again and again: ${num(extras.length)} extra copies, ${fmt(extraBytes)}. One copy of each is kept.`),
+      s.historyOnly ? h('div', { class: 'muted small' }, `${plural(s.historyOnly, 'older generation')} are in your image history but not in the storage list, so they are not counted here.`) : null,
+      btn(st.manual ? 'Hide manual tools' : 'Manual tools…', () => { st.manual = !st.manual; render(); }, { class: 'ghost', 'data-testid': 'gc-manual' }),
+      st.manual ? h('ol', { class: 'steps' },
+        h('li', {}, h('div', {}, h('b', {}, 'Repeat copies. '), `${plural(extras.length, 'extra copy', 'extra copies')}, ${fmt(extraBytes)}. One copy of each is kept.`),
           btn('Queue extra copies', selectExtraCopies, { disabled: !extras.length, 'data-testid': 'gc-queue-extras' })),
-        h('li', {}, h('div', {}, h('b', {}, 'Remove all references. '),
-          certain || st.unlock ? `Images you uploaded or pasted (screenshots, copied images): ${num(refKeys.length)} files, ${fmt(refBytes)}.`
-            : `${num(maybeRefs.length)} images (${fmt(maybeRefs.reduce((t, it) => t + (it.size || 0), 0))}) may be your uploads or pasted screenshots, but GenCull cannot yet tell them apart from generations, so this is locked.`,
-          !certain && maybeRefs.length ? h('div', { class: 'warn' }, `Why: ${st.genInfo?.error ? 'your generated-images history could not be read' : `only ${Math.round((st.cls?.linkRate || 0) * 100)}% of your generations could be matched to storage entries`}. Look at the thumbnails in the References tab and unlock there if they are all yours, or send Setup → Copy diagnostics.`) : null),
-        btn('Queue all references', selectAllReferences, { disabled: !refKeys.length, 'data-testid': 'gc-queue-refs' })),
-        h('li', {}, h('div', {}, h('b', {}, 'Cull failed generations. '), `${num(st.series.length)} series (one per chat). Star keepers, reject the rest.`),
+        h('li', {}, h('div', {}, h('b', {}, 'Uploads & pastes. '), `${plural(refKeys.length, 'image')}, ${fmt(refBytes)}.`, !certain && maybeRefs.length ? ' Locked: unlock in the References tab after checking thumbnails.' : ''),
+          btn('Queue all references', selectAllReferences, { disabled: !refKeys.length, 'data-testid': 'gc-queue-refs' })),
+        h('li', {}, h('div', {}, h('b', {}, 'Cull generations. '), `${plural(st.series.length, 'chat')}. Star keepers, reject the rest.`),
           btn('Open series', () => { st.tab = 'series'; render(); })),
-        h('li', {}, h('div', {}, h('b', {}, 'Find look-alikes. '), 'Near-identical images, e.g. a generation you downloaded and uploaded again.'),
-          btn('Open look-alikes', () => { st.tab = 'lookalikes'; render(); }))),
+        h('li', {}, h('div', {}, h('b', {}, 'Look-alikes. '), 'Near-identical images.'),
+          btn('Open look-alikes', () => { st.tab = 'lookalikes'; render(); }))) : null,
       scanFacts());
   }
 
@@ -2137,6 +2151,8 @@ h3 { font-size: 13px; margin: 16px 0 8px; color: #fff; }
 p { margin: 8px 0; }
 .muted { color: #8b8d98; } .small { font-size: 12px; }
 .intro { max-width: 560px; }
+.hero { background: #172033; border: 1px solid #28406e; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.herobig { font-size: 20px; font-weight: 650; color: #fff; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-bottom: 8px; }
 .tile { background: #1a1b1f; border: 1px solid #2c2d33; border-radius: 10px; padding: 10px; }
 .tlabel { font-size: 11px; color: #a9abb6; } .tnum { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
