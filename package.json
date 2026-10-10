@@ -1,6 +1,6 @@
 {
   "name": "gencull",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Find duplicate and reference images in ChatGPT storage, cull failed generations, and free up your quota.",
   "scripts": {

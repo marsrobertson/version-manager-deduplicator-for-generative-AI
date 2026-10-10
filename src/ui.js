@@ -421,6 +421,8 @@ const GCApp = (() => {
     status('Autopilot started…');
     await scan();
     if (!st.scannedAt || st.libInfo?.needsTeaching) { log('Autopilot stopped: storage listing not found. See Setup.'); return; }
+    // Pasted screenshots are all called image.png, so their copies need a byte check first.
+    if (st.groups.some(g => !g.confident)) { status('Autopilot: checking contents of same-name, same-size files…'); await checkDoubtfulGroups(); }
     const extras = new Set(C.planExtraCopies(st.groups));
     const refs = st.cls?.trustAbsence ? C.planAllReferences(st.items) : [];
     const keys = [...new Set([...extras, ...refs])].filter(k => markOf(k) !== 'keep');
@@ -555,6 +557,7 @@ const GCApp = (() => {
     const refBytes = refKeys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
     const certain = st.cls?.trustAbsence;
     const doubtful = st.groups.filter(g => !g.confident).length;
+    const maybeRefs = st.items.filter(it => it.image && it.fromLibrary && (it.kind === 'upload' || it.kind === 'unknown'));
     return h('div', {},
       h('div', { class: 'tiles' },
         tile('Everything', s.total.n, s.total.bytes, null, 'gc-tile-total'),
@@ -568,8 +571,10 @@ const GCApp = (() => {
       h('ol', { class: 'steps' },
         h('li', {}, h('div', {}, h('b', {}, 'Remove repeat copies. '), `Same file uploaded again and again: ${num(extras.length)} extra copies, ${fmt(extraBytes)}. One copy of each is kept.`),
           btn('Queue extra copies', selectExtraCopies, { disabled: !extras.length, 'data-testid': 'gc-queue-extras' })),
-        h('li', {}, h('div', {}, h('b', {}, 'Remove all references. '), `You keep them on your drive anyway: ${num(refKeys.length)} uploads, ${fmt(refBytes)}.`,
-          !certain && s.upload.n ? h('div', { class: 'warn' }, 'The upload/generation split is uncertain. Check thumbnails in the References tab, then unlock it there.') : null),
+        h('li', {}, h('div', {}, h('b', {}, 'Remove all references. '),
+          certain || st.unlock ? `Images you uploaded or pasted (screenshots, copied images): ${num(refKeys.length)} files, ${fmt(refBytes)}.`
+            : `${num(maybeRefs.length)} images (${fmt(maybeRefs.reduce((t, it) => t + (it.size || 0), 0))}) may be your uploads or pasted screenshots, but GenCull cannot yet tell them apart from generations, so this is locked.`,
+          !certain && maybeRefs.length ? h('div', { class: 'warn' }, `Why: ${st.genInfo?.error ? 'your generated-images history could not be read' : `only ${Math.round((st.cls?.linkRate || 0) * 100)}% of your generations could be matched to storage entries`}. Look at the thumbnails in the References tab and unlock there if they are all yours, or send Setup → Copy diagnostics.`) : null),
         btn('Queue all references', selectAllReferences, { disabled: !refKeys.length, 'data-testid': 'gc-queue-refs' })),
         h('li', {}, h('div', {}, h('b', {}, 'Cull failed generations. '), `${num(st.series.length)} series (one per chat). Star keepers, reject the rest.`),
           btn('Open series', () => { st.tab = 'series'; render(); })),
