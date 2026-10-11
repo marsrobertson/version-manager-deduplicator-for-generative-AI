@@ -97,7 +97,8 @@ test('known endpoints: scan, classify, dry run, delete references, cull a series
     await tid(page, 'gc-series-row').first().click();
     const tiles = tid(page, 'gc-gen-tile');
     assert.equal(await tiles.count(), 10);
-    await tiles.nth(0).click();
+    await tiles.nth(0).getByTestId('gc-reject').click();
+    await tiles.nth(0).click({ modifiers: ['Shift'] }); // anchor for the range
     await tiles.nth(2).click({ modifiers: ['Shift'] });
     await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 3 files' }).waitFor();
     await tiles.nth(9).locator('.star').click();
@@ -203,6 +204,41 @@ test('autopilot: one click removes copies and references, verifies, never touche
     assert.equal(s.files.length, 21);
     assert.equal(s.files.filter(f => f.kind === 'generation').length, 20);
     assert.ok(s.files.some(f => f.name === 'notes.pdf'));
+    assert.deepEqual(t.errors, []);
+  } finally { await t.done(); }
+});
+
+test('threads: delete a whole thread in one click, open its chat, download an image', async () => {
+  const t = await setup('known');
+  const { page } = t;
+  try {
+    await page.goto(t.mock.url);
+    await tid(page, 'gc-launcher').click();
+    await scan(page);
+    await tid(page, 'gc-tab-series').click();
+    await tid(page, 'gc-thread-delete').first().click();
+    await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 10 files' }).waitFor();
+    await tid(page, 'gc-series-row').first().click();
+    const tile = tid(page, 'gc-gen-tile').first();
+    assert.match(await tile.locator('a.tact').getAttribute('href'), /^\/c\/conv-aaaa-1111#msg-/);
+    const dl = page.waitForEvent('download');
+    await tile.getByTestId('gc-download').click();
+    assert.match((await dl).suggestedFilename(), /^ChatGPT Image .*\.png$/);
+    // Full-size viewer with keyboard culling.
+    await tile.click();
+    await tid(page, 'gc-viewer').waitFor();
+    await page.waitForFunction(() => document.querySelector('#gencull-host').shadowRoot.querySelector('.vcanvas')?.width === 96);
+    await page.keyboard.press('x');
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press('x');
+    await page.keyboard.press('Escape');
+    await tid(page, 'gc-viewer').waitFor({ state: 'detached' });
+    // Thumbnails are cached for next time.
+    await page.waitForFunction(async () => {
+      const db = await new Promise(r => { const q = indexedDB.open('gencull'); q.onsuccess = () => r(q.result); });
+      return new Promise(r => { const c = db.transaction('thumbs').objectStore('thumbs').count(); c.onsuccess = () => r(c.result >= 5); });
+    }, null, { timeout: 20000 });
+    await page.screenshot({ path: join(SHOTS, 'threads.png') });
     assert.deepEqual(t.errors, []);
   } finally { await t.done(); }
 });

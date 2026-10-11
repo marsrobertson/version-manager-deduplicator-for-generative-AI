@@ -7,10 +7,9 @@ const GCStore = (() => {
   function db() {
     if (!dbPromise) {
       dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 1);
+        const req = indexedDB.open(DB_NAME, 2);
         req.onupgradeneeded = () => {
-          req.result.createObjectStore('kv');
-          req.result.createObjectStore('hashes');
+          for (const name of ['kv', 'hashes', 'thumbs']) if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);

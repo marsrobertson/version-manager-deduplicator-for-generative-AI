@@ -111,8 +111,15 @@ const GCCore = (() => {
   const FULL_KEYS = ['url', 'image_url', 'imageUrl', 'download_url', 'downloadUrl', 'signed_url', 'signedUrl', 'path'];
 
   function pickUrls(obj) {
-    const thumb = pick(obj, THUMB_KEYS, looksLikeUrl, 1) ||
-      pick(obj, ['path', 'url'], looksLikeUrl, 3); // e.g. encodings.thumbnail.path
+    // A small rendition, e.g. thumbnail_url or encodings.thumbnail.path. Never fall back to the full image here.
+    let nested;
+    for (const [k, v] of Object.entries(obj)) {
+      if (isObj(v)) for (const [k2, v2] of Object.entries(v)) {
+        if (!nested && /thumb|small|preview/i.test(`${k}.${k2}`) && isObj(v2)) nested = pick(v2, ['path', 'url', 'download_url'], looksLikeUrl, 1);
+      }
+      if (!nested && /thumb|small|preview/i.test(k) && isObj(v)) nested = pick(v, ['path', 'url', 'download_url'], looksLikeUrl, 1);
+    }
+    const thumb = pick(obj, THUMB_KEYS, looksLikeUrl, 1) || nested;
     const full = pick(obj, FULL_KEYS, looksLikeUrl, 1);
     return { thumbUrl: thumb || '', url: full || '' };
   }
@@ -411,20 +418,25 @@ const GCCore = (() => {
 
   // --------------------------------------------------------------- series ----
 
-  /** Generations grouped by conversation, oldest first: a version history. */
+  /**
+   * Images grouped by chat, oldest first: a version history. Generations
+   * always; uploads too when the listing says which chat they belong to.
+   */
   function buildSeries(items) {
     const map = new Map();
     for (const it of items) {
-      if (it.kind !== 'generation') continue;
+      if (it.kind !== 'generation' && !it.conversationId) continue;
       const id = it.conversationId || '(no conversation)';
       if (!map.has(id)) map.set(id, { id, title: '', items: [], bytes: 0 });
       const s = map.get(id);
       s.items.push(it);
       s.bytes += it.size || 0;
+      if (it.fromLibrary) { s.stored = (s.stored || 0) + 1; s.storedBytes = (s.storedBytes || 0) + (it.size || 0); }
       if (!s.title && it.title) s.title = it.title;
     }
     for (const s of map.values()) s.items.sort((a, b) => (a.created || 0) - (b.created || 0));
-    return [...map.values()].sort((a, b) => b.items.length - a.items.length || b.bytes - a.bytes);
+    for (const s of map.values()) { s.stored ||= 0; s.storedBytes ||= 0; }
+    return [...map.values()].sort((a, b) => b.storedBytes - a.storedBytes || b.items.length - a.items.length);
   }
 
   // -------------------------------------------------- perceptual hashing ----

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GenCull: ChatGPT storage deduplicator
 // @namespace    https://github.com/marsrobertson/version-manager-deduplicator-for-generative-AI
-// @version      0.3.0
+// @version      0.5.0
 // @description  Find repeat uploads and reference images in ChatGPT storage, cull failed generations, free up your quota. Runs locally in your ChatGPT tab.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -128,8 +128,15 @@ const GCCore = (() => {
   const FULL_KEYS = ['url', 'image_url', 'imageUrl', 'download_url', 'downloadUrl', 'signed_url', 'signedUrl', 'path'];
 
   function pickUrls(obj) {
-    const thumb = pick(obj, THUMB_KEYS, looksLikeUrl, 1) ||
-      pick(obj, ['path', 'url'], looksLikeUrl, 3); // e.g. encodings.thumbnail.path
+    // A small rendition, e.g. thumbnail_url or encodings.thumbnail.path. Never fall back to the full image here.
+    let nested;
+    for (const [k, v] of Object.entries(obj)) {
+      if (isObj(v)) for (const [k2, v2] of Object.entries(v)) {
+        if (!nested && /thumb|small|preview/i.test(`${k}.${k2}`) && isObj(v2)) nested = pick(v2, ['path', 'url', 'download_url'], looksLikeUrl, 1);
+      }
+      if (!nested && /thumb|small|preview/i.test(k) && isObj(v)) nested = pick(v, ['path', 'url', 'download_url'], looksLikeUrl, 1);
+    }
+    const thumb = pick(obj, THUMB_KEYS, looksLikeUrl, 1) || nested;
     const full = pick(obj, FULL_KEYS, looksLikeUrl, 1);
     return { thumbUrl: thumb || '', url: full || '' };
   }
@@ -428,20 +435,25 @@ const GCCore = (() => {
 
   // --------------------------------------------------------------- series ----
 
-  /** Generations grouped by conversation, oldest first: a version history. */
+  /**
+   * Images grouped by chat, oldest first: a version history. Generations
+   * always; uploads too when the listing says which chat they belong to.
+   */
   function buildSeries(items) {
     const map = new Map();
     for (const it of items) {
-      if (it.kind !== 'generation') continue;
+      if (it.kind !== 'generation' && !it.conversationId) continue;
       const id = it.conversationId || '(no conversation)';
       if (!map.has(id)) map.set(id, { id, title: '', items: [], bytes: 0 });
       const s = map.get(id);
       s.items.push(it);
       s.bytes += it.size || 0;
+      if (it.fromLibrary) { s.stored = (s.stored || 0) + 1; s.storedBytes = (s.storedBytes || 0) + (it.size || 0); }
       if (!s.title && it.title) s.title = it.title;
     }
     for (const s of map.values()) s.items.sort((a, b) => (a.created || 0) - (b.created || 0));
-    return [...map.values()].sort((a, b) => b.items.length - a.items.length || b.bytes - a.bytes);
+    for (const s of map.values()) { s.stored ||= 0; s.storedBytes ||= 0; }
+    return [...map.values()].sort((a, b) => b.storedBytes - a.storedBytes || b.items.length - a.items.length);
   }
 
   // -------------------------------------------------- perceptual hashing ----
@@ -776,10 +788,9 @@ const GCStore = (() => {
   function db() {
     if (!dbPromise) {
       dbPromise = new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, 1);
+        const req = indexedDB.open(DB_NAME, 2);
         req.onupgradeneeded = () => {
-          req.result.createObjectStore('kv');
-          req.result.createObjectStore('hashes');
+          for (const name of ['kv', 'hashes', 'thumbs']) if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
         };
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
@@ -1256,7 +1267,7 @@ const GCNet = (() => {
 const GCApp = (() => {
   'use strict';
   const C = GCCore, N = GCNet, S = GCStore;
-  const VERSION = '0.3.0';
+  const VERSION = '0.5.0';
   const fmt = C.formatBytes;
   const num = n => Number(n || 0).toLocaleString();
 
@@ -1438,7 +1449,7 @@ const GCApp = (() => {
   }
 
   function pumpThumbs() {
-    while (thumbActive < 4 && thumbQueue.length) {
+    while (thumbActive < 6 && thumbQueue.length) {
       const cv = thumbQueue.pop(); // newest first: what you are looking at now
       if (!cv.isConnected) { cv.__state = 'idle'; continue; }
       thumbActive++;
@@ -1455,6 +1466,7 @@ const GCApp = (() => {
 
   async function decode(blob, w, hgt) {
     const opts = { resizeQuality: 'medium' };
+    if (!w && !hgt) return createImageBitmap(blob);
     if (w) opts.resizeWidth = w;
     if (hgt) opts.resizeHeight = hgt;
     return createImageBitmap(blob, opts);
@@ -1484,14 +1496,130 @@ const GCApp = (() => {
     return next;
   }
 
+  // Per-image actions: open its chat, download the original.
+  function tileActions(it) {
+    const stop = fn => e => { e.stopPropagation(); fn(); };
+    const m = markOf(it.key);
+    return h('div', { class: 'tacts' },
+      h('button', { type: 'button', class: `tact ${m === 'reject' ? 'on' : ''}`, title: m === 'reject' ? 'Unqueue' : 'Queue for deletion', 'data-testid': 'gc-reject', onclick: stop(() => { setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you'); render(); }) }, '✕'),
+      it.conversationId ? h('a', { class: 'tact', href: `/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, target: '_blank', rel: 'noopener', title: 'Open the chat this image is from', onclick: e => e.stopPropagation() }, '↗') : null,
+      h('button', { type: 'button', class: 'tact', title: 'Download full-size image', 'data-testid': 'gc-download', onclick: stop(() => downloadImage(it)) }, '⬇'));
+  }
+
+  async function downloadImage(it) {
+    status(`Downloading ${it.name || 'image'}…`);
+    const blob = await N.imageBlob(it, { full: true });
+    if (!blob) { status('Download failed: ChatGPT did not return the image.'); return; }
+    const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+    const base = (it.name || it.title || it.fileId || 'image').replace(/[\\/:*?"<>|]+/g, '_').replace(/\.[a-z0-9]{2,5}$/i, '');
+    const url = URL.createObjectURL(blob);
+    const a = h('a', { href: url, download: `${base}.${ext}` });
+    root.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    status(`Downloaded ${base}.${ext}`);
+  }
+
+  // ------------------------------------------------- full-size viewer ----
+
+  const fullCache = new Map(); // key -> Promise<Blob|null>, last few only
+  function fullBlob(it) {
+    if (!fullCache.has(it.key)) {
+      fullCache.set(it.key, N.imageBlob(it, { full: true }).catch(() => null));
+      while (fullCache.size > 8) fullCache.delete(fullCache.keys().next().value);
+    }
+    return fullCache.get(it.key);
+  }
+
+  let viewerEl = null;
+  function openViewer(list, idx) {
+    st.viewer = { list, idx };
+    if (!viewerEl) {
+      viewerEl = h('div', { class: 'viewer', 'data-testid': 'gc-viewer' });
+      root.append(viewerEl);
+      document.addEventListener('keydown', viewerKeys, true);
+    }
+    drawViewer();
+  }
+  function closeViewer() {
+    st.viewer = null;
+    document.removeEventListener('keydown', viewerKeys, true);
+    viewerEl?.remove(); viewerEl = null;
+    render();
+  }
+  function viewerKeys(e) {
+    const v = st.viewer;
+    if (!v || e.metaKey || e.ctrlKey || e.altKey) return;
+    const it = v.list[v.idx];
+    const act = {
+      Escape: closeViewer,
+      ArrowRight: () => { v.idx = Math.min(v.list.length - 1, v.idx + 1); drawViewer(); },
+      ArrowLeft: () => { v.idx = Math.max(0, v.idx - 1); drawViewer(); },
+      x: () => { setMark([it.key], markOf(it.key) === 'reject' ? null : 'reject', 'rejected by you'); drawViewer(); },
+      s: () => { setMark([it.key], markOf(it.key) === 'keep' ? null : 'keep', 'kept by you'); drawViewer(); },
+      d: () => downloadImage(it),
+      o: () => { if (it.conversationId) window.open(`/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, '_blank', 'noopener'); },
+    }[e.key.length === 1 ? e.key.toLowerCase() : e.key];
+    if (!act) return;
+    e.preventDefault(); e.stopPropagation(); // keep ChatGPT from typing these keys
+    act();
+  }
+
+  async function drawViewer() {
+    const v = st.viewer;
+    if (!v || !viewerEl) return;
+    const it = v.list[v.idx];
+    const m = markOf(it.key);
+    const cv = h('canvas', { class: 'vcanvas' });
+    const info = [it.name || it.title || '', it.size ? fmt(it.size) : '', it.created ? new Date(it.created).toLocaleString() : '', it.kind].filter(Boolean).join(' · ');
+    viewerEl.replaceChildren(
+      h('div', { class: 'vbar' },
+        h('b', {}, `${v.idx + 1} / ${v.list.length}`),
+        h('span', { class: `vstate ${m || ''}` }, m === 'reject' ? '✕ queued for deletion' : m === 'keep' ? '★ kept' : ''),
+        h('span', { class: 'muted vinfo' }, info),
+        h('span', { class: 'vbtns' },
+          btn('← Prev', () => { v.idx = Math.max(0, v.idx - 1); drawViewer(); }, { disabled: v.idx === 0 }),
+          btn('Next →', () => { v.idx = Math.min(v.list.length - 1, v.idx + 1); drawViewer(); }, { disabled: v.idx === v.list.length - 1 }),
+          btn(m === 'reject' ? 'Unqueue (X)' : 'Delete (X)', () => { setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you'); drawViewer(); }, { class: m === 'reject' ? '' : 'danger', 'data-testid': 'gc-viewer-reject' }),
+          btn(m === 'keep' ? 'Unstar (S)' : '★ Keep (S)', () => { setMark([it.key], m === 'keep' ? null : 'keep', 'kept by you'); drawViewer(); }),
+          btn('⬇ (D)', () => downloadImage(it)),
+          it.conversationId ? h('a', { class: 'link', href: `/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, target: '_blank', rel: 'noopener' }, 'Chat ↗ (O)') : null,
+          btn('Close (Esc)', closeViewer))),
+      it.prompt ? h('div', { class: 'vprompt' }, it.prompt) : null,
+      h('div', { class: 'vstage' }, cv));
+    const blob = await fullBlob(it);
+    // Prefetch neighbours so arrowing through a series feels instant.
+    if (v.list[v.idx + 1]) fullBlob(v.list[v.idx + 1]);
+    if (st.viewer !== v || v.list[v.idx] !== it) return;
+    if (!blob) { cv.width = 400; cv.height = 200; paintMessage(cv, 'could not load the full image'); return; }
+    try {
+      // Canvas, not <img>: ChatGPT's security policy may block blob: images.
+      const bmp = await createImageBitmap(blob);
+      cv.width = bmp.width; cv.height = bmp.height;
+      cv.getContext('2d').drawImage(bmp, 0, 0);
+      bmp.close?.();
+      cv.title = `${bmp.width}×${bmp.height}`;
+    } catch { cv.width = 400; cv.height = 200; paintMessage(cv, 'cannot display this file type'); }
+  }
+
+  async function saveThumb(item, blob) {
+    const bmp = await decode(blob, 240);
+    const c = h('canvas', { width: bmp.width, height: bmp.height });
+    c.getContext('2d').drawImage(bmp, 0, 0);
+    bmp.close?.();
+    const small = await new Promise(res => c.toBlob(res, 'image/webp', 0.75));
+    if (small) await S.set('thumbs', item.key, small);
+  }
+
   async function drawThumb(cv) {
     const item = cv.__item;
     cv.__state = 'loading';
     paintMessage(cv, 'loading…');
     try {
-      const blob = await N.imageBlob(item);
+      // Saved previews (about 10 KB each) make every later visit instant.
+      const cached = await S.get('thumbs', item.key);
+      const blob = cached || await N.imageBlob(item);
       if (!blob) { cv.__state = 'failed'; paintMessage(cv, 'no preview'); return; }
-      const bmp = await decode(blob, Math.min(cv.width * 2, 400));
+      const bmp = await decode(blob, cached ? 0 : Math.min(cv.width * 2, 400));
       const g = cv.getContext('2d');
       g.fillStyle = '#1b1c1f'; g.fillRect(0, 0, cv.width, cv.height);
       const r = Math.min(cv.width / bmp.width, cv.height / bmp.height);
@@ -1499,6 +1627,7 @@ const GCApp = (() => {
       g.drawImage(bmp, (cv.width - w) / 2, (cv.height - hh) / 2, w, hh);
       bmp.close?.();
       cv.__state = 'done';
+      if (!cached) saveThumb(item, blob).catch(() => {});
       if (!st.hashes.get(item.key)?.d) rememberHash(item, blob).catch(() => {});
     } catch {
       cv.__state = 'failed'; paintMessage(cv, 'no preview');
@@ -1915,17 +2044,29 @@ const GCApp = (() => {
     if (!st.scannedAt) return h('p', { class: 'muted' }, 'Scan first.');
     const s = st.openSeries && st.series.find(x => x.id === st.openSeries);
     if (!s) {
+      // Threads that take up storage, biggest first. History-only ones cannot be deleted from storage anyway.
+      const all = st.series.filter(x => st.showHistoryOnly || x.stored);
+      const deletable = x => x.items.filter(it => it.fromLibrary && markOf(it.key) !== 'keep');
       const list = h('div', { class: 'rows' });
-      for (const x of st.series) {
+      for (const x of all.slice(0, st.seriesLimit || 200)) {
+        const del = deletable(x);
         const rej = x.items.filter(it => markOf(it.key) === 'reject').length;
-        const kept = x.items.filter(it => markOf(it.key) === 'keep').length;
-        list.append(h('div', { class: 'row click', 'data-testid': 'gc-series-row', onclick: () => { st.openSeries = x.id; render(); } },
+        const whole = del.length > 0 && del.every(it => markOf(it.key) === 'reject');
+        list.append(h('div', { class: `row click ${whole ? 'queued' : ''}`, 'data-testid': 'gc-series-row', onclick: () => { st.openSeries = x.id; render(); } },
           thumb(x.items[x.items.length - 1], 56),
           h('div', { class: 'rmain' },
             h('div', { class: 'rname' }, x.title || (x.id === '(no conversation)' ? 'Not linked to a chat' : `Chat ${x.id.slice(0, 8)}`)),
-            h('div', { class: 'muted small' }, `${num(x.items.length)} images · ${fmt(x.bytes)} · ★ ${kept} · ✕ ${rej}`))));
+            h('div', { class: 'muted small' }, `${num(x.stored)} in storage · ${fmt(x.storedBytes)}${x.items.length > x.stored ? ` · ${num(x.items.length - x.stored)} older not in storage` : ''}${rej ? ` · ✕ ${num(rej)} queued` : ''}`)),
+          whole ? btn('Undo', e => { e.stopPropagation(); setMark(del.map(it => it.key), null); render(); })
+            : btn('Delete whole thread', e => { e.stopPropagation(); setMark(del.map(it => it.key), 'reject', 'whole thread'); render(); }, { disabled: !del.length, 'data-testid': 'gc-thread-delete' })));
       }
-      return h('div', {}, h('div', { class: 'note' }, 'Each series is one chat, oldest image first: your version history. Open one, star the keepers, reject the rest.'), list);
+      const wrap = h('div', {},
+        h('div', { class: 'note' }, 'One row per chat, biggest first. "Delete whole thread" queues every image of that chat that is in storage (starred ones excepted). Click a row to pick images one by one. Then press Delete… at the bottom.'),
+        h('label', { class: 'unlock' }, h('input', { type: 'checkbox', checked: !!st.showHistoryOnly, onchange: e => { st.showHistoryOnly = e.target.checked; render(); } }), ' Also show chats whose images are only in history'),
+        h('div', { class: 'muted small' }, `${plural(all.length, 'chat')}.`),
+        list);
+      if (all.length > (st.seriesLimit || 200)) wrap.append(btn(`Show more (${num(all.length - (st.seriesLimit || 200))} left)`, () => { st.seriesLimit = (st.seriesLimit || 200) + 300; render(); }));
+      return wrap;
     }
     const doTile = (it, i) => {
       const m = markOf(it.key);
@@ -1933,17 +2074,20 @@ const GCApp = (() => {
         thumb(it, 150),
         h('div', { class: 'gmeta' }, `v${i + 1}`, it.created ? ` · ${new Date(it.created).toLocaleDateString()}` : '', it.size ? ` · ${fmt(it.size)}` : ''),
         btn(m === 'keep' ? '★' : '☆', e => { e.stopPropagation(); setMark([it.key], m === 'keep' ? null : 'keep', 'kept by you'); render(); }, { class: 'star', title: 'Keep (protects from bulk actions)' }),
-        m === 'reject' ? h('div', { class: 'x' }, '✕') : null);
+        m === 'reject' ? h('div', { class: 'x' }, '✕') : null,
+        tileActions(it));
       el.addEventListener('click', e => {
         const idx = s.items.indexOf(it);
-        if (e.shiftKey && st.lastClicked != null) {
-          const [a, b] = [Math.min(idx, st.lastClicked), Math.max(idx, st.lastClicked)];
+        if (e.shiftKey) {
+          const anchor = st.lastClicked ?? idx;
+          const [a, b] = [Math.min(idx, anchor), Math.max(idx, anchor)];
           setMark(s.items.slice(a, b + 1).map(x => x.key), 'reject', 'rejected by you');
-        } else {
-          setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you');
+          st.lastClicked = idx;
+          render();
+          return;
         }
         st.lastClicked = idx;
-        render();
+        openViewer(s.items, idx);
       });
       return el;
     };
@@ -1954,7 +2098,7 @@ const GCApp = (() => {
         s.id !== '(no conversation)' ? h('a', { href: `/c/${s.id}`, target: '_blank', rel: 'noopener', class: 'link' }, 'Open chat ↗') : null,
         btn('Reject all not starred', () => { setMark(s.items.filter(it => markOf(it.key) !== 'keep').map(it => it.key), 'reject', 'rejected by you'); render(); }, { 'data-testid': 'gc-reject-unstarred' }),
         btn('Clear marks', () => { setMark(s.items.map(it => it.key), null); render(); })),
-      h('div', { class: 'muted small' }, `${s.title || s.id} · ${num(s.items.length)} images · ${num(rej.length)} rejected (${fmt(rej.reduce((t, it) => t + (it.size || 0), 0))}). Click = reject, shift-click = reject a range, ☆ = keep.`),
+      h('div', { class: 'muted small' }, `${s.title || s.id} · ${num(s.items.length)} images · ${num(rej.length)} rejected (${fmt(rej.reduce((t, it) => t + (it.size || 0), 0))}). Click = view full size (← → move, X delete, S keep, D download, O open chat). ✕ = queue, shift-click = queue a range, ☆ = keep.`),
       h('div', { class: 'grid' }, s.items.map(doTile)));
   }
 
@@ -1994,8 +2138,9 @@ const GCApp = (() => {
           const el = h('div', { class: `gtile ${m === 'reject' ? 'rej' : ''} ${it === keeper ? 'kept' : ''}` },
             thumb(it, 120),
             h('div', { class: 'gmeta' }, `${it.kind}${it.name ? ` · ${it.name}` : ''}`),
-            m === 'reject' ? h('div', { class: 'x' }, '✕') : null);
-          el.addEventListener('click', () => { setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you'); render(); });
+            m === 'reject' ? h('div', { class: 'x' }, '✕') : null,
+            tileActions(it));
+          el.addEventListener('click', () => openViewer(g, g.indexOf(it)));
           return el;
         }))));
     }
@@ -2166,7 +2311,7 @@ p { margin: 8px 0; }
 .unlock { display: flex; gap: 6px; align-items: center; font-size: 12px; margin: 6px 0; }
 .rows { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
 .row { display: flex; align-items: center; gap: 10px; padding: 6px; border-radius: 8px; background: #17181c; }
-.row.click { cursor: pointer; } .row.click:hover { background: #1f2025; }
+.row.click { cursor: pointer; } .row.queued { background: #2a1715; } .row.click:hover { background: #1f2025; }
 .rmain { flex: 1; min-width: 0; } .rname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg { display: flex; } .seg button { border-radius: 0; margin-left: -1px; padding: 4px 8px; font-size: 12px; }
 .seg button:first-child { border-radius: 7px 0 0 7px; } .seg button:last-child { border-radius: 0 7px 7px 0; }
@@ -2180,6 +2325,18 @@ p { margin: 8px 0; }
 .gtile.kept { border-color: #d8b35a; }
 .gmeta { font-size: 11px; color: #8b8d98; padding: 3px 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .star { position: absolute; top: 7px; right: 7px; padding: 1px 6px; font-size: 13px; background: rgba(0,0,0,.55); border: none; color: #f3d88b; }
+.viewer { position: fixed; inset: 0; z-index: 2147483003; background: rgba(8,8,10,.96); display: flex; flex-direction: column; color: #e8e8ec; font: 13px/1.4 system-ui, -apple-system, sans-serif; }
+.vbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #2c2d33; }
+.vinfo { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vbtns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.vstate.reject { color: #ff6b61; font-weight: 600; } .vstate.keep { color: #f3d88b; font-weight: 600; }
+.vprompt { padding: 6px 14px; color: #a9abb6; font-size: 12px; max-height: 3.2em; overflow: hidden; }
+.vstage { flex: 1; min-height: 0; display: grid; place-items: center; padding: 10px; overflow: auto; }
+.vcanvas { max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
+.tact.on { background: #b3261e; }
+.tacts { position: absolute; bottom: 24px; right: 7px; display: flex; gap: 4px; }
+.tact { font: 13px/1 system-ui, sans-serif; padding: 4px 7px; background: rgba(0,0,0,.65); border: none; border-radius: 6px; color: #fff; text-decoration: none; cursor: pointer; }
+.tact:hover { background: #2b5bd7; }
 .x { position: absolute; inset: 0; display: grid; place-items: center; font-size: 42px; color: #ff6b61; pointer-events: none; }
 .lgroup { border: 1px solid #2c2d33; border-radius: 10px; padding: 6px 8px; margin: 8px 0; }
 .delbox { border: 1px solid #28406e; background: #141b2b; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
