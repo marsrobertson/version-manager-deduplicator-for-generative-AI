@@ -188,7 +188,7 @@ test('no generated-images history: bulk reference removal stays locked, copies k
   } finally { await t.done(); }
 });
 
-test('autopilot: one click removes copies and references, verifies, never touches generations', async () => {
+test('autopilot: backs up, then removes copies and backed-up uploads, verifies, never touches generations', async () => {
   const t = await setup('known');
   const { page } = t;
   try {
@@ -196,6 +196,20 @@ test('autopilot: one click removes copies and references, verifies, never touche
     page.on('dialog', d => { dialog = d.message(); d.accept(); });
     await page.goto(t.mock.url);
     await tid(page, 'gc-launcher').click();
+    // Stand in for the folder picker with the browser's private file system (same API).
+    await page.evaluate(() => { window.showDirectoryPicker = async () => navigator.storage.getDirectory(); });
+    await tid(page, 'gc-scan').click();
+    await tid(page, 'gc-backup').click();
+    await page.waitForFunction(() => /Backup done: 33 of 33/.test(document.querySelector('#gencull-host').shadowRoot.querySelector('[data-testid=gc-status]')?.textContent || ''), null, { timeout: 60000 });
+    const files = await page.evaluate(async () => {
+      const out = [];
+      const walk = async (d, p) => { for await (const [n, h] of d.entries()) h.kind === 'directory' ? await walk(h, `${p}${n}/`) : out.push(`${p}${n}`); };
+      await walk(await navigator.storage.getDirectory(), '');
+      return out;
+    });
+    assert.ok(files.includes('index.csv'));
+    assert.equal(files.filter(f => f.startsWith('Uploads and pastes/')).length, 13);
+    assert.ok(files.some(f => f.startsWith('Neon fox poster (conv-aaa')));
     await tid(page, 'gc-dryrun').uncheck();
     await tid(page, 'gc-autopilot').click();
     await page.waitForFunction(() => /Autopilot done/.test(document.querySelector('#gencull-host').shadowRoot.querySelector('[data-testid=gc-status]')?.textContent || ''), null, { timeout: 60000 });

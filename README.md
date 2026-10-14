@@ -35,12 +35,22 @@ The storage page lets you delete one file at a time. With 10,000 images, that is
 
 ![Culling a series on test data](docs/screenshot-series.png)
 
+## Back up your library
+
+**Back up library to a folder…** (Overview) saves every image in storage into a folder you pick:
+
+- one subfolder per chat, and `Uploads and pastes` for the rest;
+- an `index.csv` with each file's chat link, date and prompt;
+- tick *include older generations* to also save images that are only in your history.
+
+Run it again any time: files already saved are skipped, so an interrupted backup resumes. It needs Chrome or Edge, because Firefox and Safari can't write to a folder.
+
 ## Autopilot (least effort)
 
 Untick **Dry run** and press **Autopilot: remove copies & references**. It runs entirely in your browser and needs no Claude tokens:
 
 1. Scans your storage.
-2. Queues only the safe deletions: extra copies, plus uploaded reference images when the upload/generation split is certain.
+2. Queues only the safe deletions: extra copies (one copy always stays), plus uploaded or pasted images **that GenCull has already saved to your computer** with **Back up library**. Uploads that are not backed up are never deleted by Autopilot.
 3. Shows one confirmation with the counts, then downloads the list of files.
 4. Deletes one test file and re-reads the storage listing to prove it is gone. If it is still listed, autopilot pauses.
 5. Deletes the rest, then rescans and reports the space freed.
@@ -97,7 +107,7 @@ Then do the same with **references**, then work through **Series** at your own p
 
 ### Exact copies
 
-Copies are files with the **same name and the same byte size**. Uploading the same file from your drive gives exactly that, so this works without downloading anything. There are two exceptions:
+Copies are files with the **same name and the same byte size**. Uploading or pasting the same image again gives exactly that, so this works without downloading anything. There are two exceptions:
 
 - **Generic names** (`image.png`, `untitled.jpg`, `ChatGPT Image.png`). Two different images can share both the name and the size by coincidence.
 - **Two generations with the same name and size.** Each generation is unique, so matching sizes are more likely a coincidence than a copy.
@@ -127,7 +137,7 @@ The sketches are cached in your browser. Fingerprinting may need to download eac
 
 - **Unofficial.** These are internal endpoints. OpenAI can change them at any time, and GenCull will then fail (loudly, not silently).
 - **Terms of Use.** OpenAI's [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid "automatically or programmatically extract[ing] data or Output". GenCull reads your own file list in order to delete your own files, at a gentle pace. That is a narrow use, but it is still automated access, so the decision is yours. I am not aware of accounts being penalised for storage cleanup tools; I also have no evidence either way.
-- **Deleted means deleted.** Once a file is gone, the chat that used it shows a missing image. For references you keep on your drive, that is the point. For generations, download first if unsure.
+- **Deleted means deleted.** Once a file is gone, the chat that used it shows a missing image. Use **Back up library to a folder…** first: it saves every image (one subfolder per chat, plus `index.csv` with chat links and prompts) and can be re-run to resume. Chrome or Edge only.
 
 ## What is not verified
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GenCull: ChatGPT storage deduplicator
 // @namespace    https://github.com/marsrobertson/version-manager-deduplicator-for-generative-AI
-// @version      0.5.0
+// @version      0.6.0
 // @description  Find repeat uploads and reference images in ChatGPT storage, cull failed generations, free up your quota. Runs locally in your ChatGPT tab.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -1267,7 +1267,7 @@ const GCNet = (() => {
 const GCApp = (() => {
   'use strict';
   const C = GCCore, N = GCNet, S = GCStore;
-  const VERSION = '0.5.0';
+  const VERSION = '0.6.0';
   const fmt = C.formatBytes;
   const num = n => Number(n || 0).toLocaleString();
 
@@ -1339,6 +1339,78 @@ const GCApp = (() => {
   async function loadMarks() {
     const saved = await S.get('kv', 'marks');
     if (Array.isArray(saved)) st.marks = new Map(saved);
+    const backed = await S.get('kv', 'backedUp');
+    if (Array.isArray(backed)) st.backedUp = new Set(backed);
+  }
+
+  // ------------------------------------------------------------- backup ----
+
+  st.backedUp = new Set();
+  const safeName = (t, max = 80) => String(t || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, max) || 'untitled';
+  const extOf = it => (it.mime && it.mime.split('/')[1]?.replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')) || (it.name.match(/\.([a-z0-9]{2,5})$/i)?.[1]) || 'png';
+  /** Uploads not saved to your computer yet: Autopilot will not delete these. */
+  const refsNeedingBackup = () => (st.cls?.trustAbsence ? C.planAllReferences(st.items) : []).filter(k => !st.backedUp.has(k));
+
+  function backupPath(it, titles) {
+    const folder = it.conversationId ? safeName(`${titles.get(it.conversationId) || 'Chat'} (${it.conversationId.slice(0, 8)})`)
+      : it.kind === 'generation' ? 'Not linked to a chat' : 'Uploads and pastes';
+    const date = it.created ? new Date(it.created).toISOString().slice(0, 10) : 'undated';
+    const base = safeName((it.name || it.title || 'image').replace(/\.[a-z0-9]{2,5}$/i, ''), 60);
+    // A short hash of the file's id keeps names unique, so a skip on re-run really means "this file is saved".
+    let hsh = 0x811c9dc5;
+    for (const ch of String(it.key)) hsh = Math.imul(hsh ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    return [folder, `${date} ${base} ${hsh.toString(16).padStart(8, '0')}.${extOf(it)}`];
+  }
+
+  /**
+   * Save images into a folder you pick, one subfolder per chat. Files that
+   * are already there are skipped, so an interrupted backup can be resumed.
+   */
+  async function backupLibrary() {
+    if (!window.showDirectoryPicker) { status('Saving to a folder needs Chrome or Edge.'); log('Backup needs the File System Access API (Chrome or Edge).'); return false; }
+    let dir;
+    try { dir = await window.showDirectoryPicker({ mode: 'readwrite', id: 'gencull-backup' }); } catch { status('Backup cancelled.'); return false; }
+    const titles = new Map(st.series.map(x => [x.id, x.title]));
+    const targets = st.items.filter(it => it.image && (st.backupHistory || it.fromLibrary));
+    st.bk = { running: true, done: 0, saved: 0, skipped: 0, failed: 0, total: targets.length, abort: new AbortController() };
+    render();
+    const rows = [['folder', 'file', 'kind', 'size', 'created', 'chat', 'prompt']];
+    const dirs = new Map();
+    const sub = async name => { if (!dirs.has(name)) dirs.set(name, dir.getDirectoryHandle(name, { create: true })); return dirs.get(name); };
+    try {
+      await pool(targets, 3, async it => {
+        const [folder, file] = backupPath(it, titles);
+        try {
+          const d = await sub(folder);
+          let exists = false;
+          try { const fh = await d.getFileHandle(file); exists = (await fh.getFile()).size > 0; } catch { /* not there yet */ }
+          if (exists) st.bk.skipped++;
+          else {
+            const blob = await N.imageBlob(it, { full: true, signal: st.bk.abort.signal });
+            if (!blob) { st.bk.failed++; return; }
+            const w = await (await d.getFileHandle(file, { create: true })).createWritable();
+            await w.write(blob); await w.close();
+            st.bk.saved++;
+          }
+          st.backedUp.add(it.key);
+          rows.push([folder, file, it.kind, it.size || '', it.created ? new Date(it.created).toISOString() : '', it.conversationId ? `${location.origin}/c/${it.conversationId}` : '', (it.prompt || '').replace(/\s+/g, ' ')]);
+        } catch (e) { if (e.name === 'AbortError') throw e; st.bk.failed++; }
+        finally {
+          st.bk.done++;
+          if (st.bk.done % 10 === 0 || st.bk.done === st.bk.total) { status(`Backup: ${num(st.bk.done)} / ${num(st.bk.total)} (${num(st.bk.saved)} saved, ${num(st.bk.skipped)} already there, ${num(st.bk.failed)} failed)`); S.set('kv', 'backedUp', [...st.backedUp]); }
+        }
+      }, st.bk.abort.signal);
+      const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+      const w = await (await dir.getFileHandle('index.csv', { create: true })).createWritable();
+      await w.write(csv); await w.close();
+    } finally {
+      S.set('kv', 'backedUp', [...st.backedUp]);
+      const b = st.bk; b.running = false;
+      log(`Backup finished: ${num(b.saved)} saved, ${num(b.skipped)} already there, ${num(b.failed)} failed, of ${num(b.total)}.`);
+      status(`Backup done: ${num(b.saved + b.skipped)} of ${num(b.total)} images are in your folder${b.failed ? `, ${num(b.failed)} failed (run again to retry)` : ''}.`);
+      render();
+    }
+    return true;
   }
 
   const markOf = key => st.marks.get(key)?.m;
@@ -1804,13 +1876,16 @@ const GCApp = (() => {
     // Pasted screenshots are all called image.png, so their copies need a byte check first.
     if (st.groups.some(g => !g.confident)) { status('Autopilot: checking contents of same-name, same-size files…'); await checkDoubtfulGroups(); }
     const extras = new Set(C.planExtraCopies(st.groups));
-    const refs = st.cls?.trustAbsence ? C.planAllReferences(st.items) : [];
+    // Uploads are only deleted once they are saved on your computer.
+    const notBacked = refsNeedingBackup();
+    const refs = (st.cls?.trustAbsence ? C.planAllReferences(st.items) : []).filter(k => st.backedUp.has(k));
     const keys = [...new Set([...extras, ...refs])].filter(k => markOf(k) !== 'keep');
     if (!keys.length) { log('Autopilot: nothing safe to delete automatically.'); status('Autopilot: nothing safe to delete.'); return; }
     const bytes = keys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
     const msg = `GenCull autopilot\n\n${st.dryRun ? 'DRY RUN (nothing is sent): ' : ''}delete ${num(keys.length)} files, ${fmt(bytes)}:\n` +
       `• ${num(extras.size)} extra copies (one copy of each file is kept)\n` +
-      `• ${st.cls?.trustAbsence ? `${num(refs.length)} uploaded reference images` : 'reference uploads skipped: upload/generation split is uncertain'}\n\n` +
+      `• ${st.cls?.trustAbsence ? `${num(refs.length)} uploaded or pasted images that are backed up in your folder` : 'uploads skipped: upload/generation split is uncertain'}\n` +
+      (notBacked.length ? `• ${num(notBacked.length)} uploads are NOT backed up yet and are left alone\n` : '') + '\n' +
       'Generations are not touched. A list of the files downloads first, and one test file is deleted and verified before the rest.\n\nContinue?';
     if (!window.confirm(msg)) { log('Autopilot cancelled.'); return; }
     setMark([...extras], 'reject', 'extra copy');
@@ -1936,18 +2011,27 @@ const GCApp = (() => {
     const certain = st.cls?.trustAbsence;
     const refKeys = C.planAllReferences(st.items, { allowUncertain: st.unlock });
     const refBytes = refKeys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
-    const autoKeys = [...new Set([...extras, ...(certain ? C.planAllReferences(st.items) : [])])];
+    const backedRefs = (certain ? C.planAllReferences(st.items) : []).filter(k => st.backedUp.has(k));
+    const autoKeys = [...new Set([...extras, ...backedRefs])];
     const autoBytes = autoKeys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
-    const autoRefs = certain ? C.planAllReferences(st.items).length : 0;
+    const autoRefs = backedRefs.length;
+    const needBackup = refsNeedingBackup();
+    const needBackupBytes = needBackup.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
+    const bk = st.bk;
     const doubtful = st.groups.filter(g => !g.confident).length;
     const maybeRefs = st.items.filter(it => it.image && it.fromLibrary && (it.kind === 'upload' || it.kind === 'unknown'));
-    const busy = st.scanning || st.del?.phase === 'running' || st.auto;
+    const busy = st.scanning || st.del?.phase === 'running' || st.auto || st.bk?.running;
     return h('div', {},
       h('div', { class: 'hero' },
-        h('div', { class: 'herobig', 'data-testid': 'gc-hero' }, autoKeys.length ? `Autopilot can free ${fmt(autoBytes)}` : 'Nothing to delete automatically'),
+        h('div', { class: 'herobig', 'data-testid': 'gc-hero' }, autoKeys.length ? `Autopilot can free ${fmt(autoBytes)}` : needBackup.length ? `Back up first, then free ${fmt(needBackupBytes)}` : 'Nothing to delete automatically'),
         h('div', { class: 'muted' }, autoKeys.length
-          ? `${plural(autoRefs, 'image')} you uploaded or pasted, plus ${plural(extras.length, 'extra copy', 'extra copies')}. Your generations are never touched.`
+          ? `${plural(extras.length, 'extra copy', 'extra copies')}${autoRefs ? ` and ${plural(autoRefs, 'backed-up upload')}` : ''}. Your generations are never touched.`
           : 'Use Manual tools below to cull generations.'),
+        needBackup.length ? h('div', { class: 'note' }, `${plural(needBackup.length, 'image')} you uploaded or pasted (${fmt(needBackupBytes)}) are not saved on your computer yet. Autopilot only deletes them after a backup.`) : null,
+        h('div', { class: 'bar' },
+          bk?.running ? btn(`Stop backup (${num(bk.done)} / ${num(bk.total)})`, () => bk.abort.abort())
+            : btn('Back up library to a folder…', backupLibrary, { class: autoKeys.length ? '' : 'primary big', disabled: busy, 'data-testid': 'gc-backup', title: 'Saves every image into a folder you pick, one subfolder per chat, plus index.csv. Re-running skips what is already saved.' }),
+          h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: !!st.backupHistory, onchange: e => { st.backupHistory = e.target.checked; render(); } }), ` include ${num(s.historyOnly)} older generations not in storage`)),
         !certain && maybeRefs.length ? h('div', { class: 'warn' }, `${plural(maybeRefs.length, 'image')} (${fmt(maybeRefs.reduce((t, it) => t + (it.size || 0), 0))}) may be your uploads, but GenCull could not confirm it (${st.genInfo?.error ? 'generated-images history unavailable' : 'too few generations matched'}). Autopilot leaves them alone.`) : null,
         autoKeys.length ? btn(st.dryRun ? 'Autopilot (dry run: show what it would delete)' : `Autopilot: delete ${num(autoKeys.length)} files`, autopilot, { class: st.dryRun ? 'primary big' : 'danger big', disabled: busy, 'data-testid': 'gc-autopilot' }) : null,
         autoKeys.length && st.dryRun ? h('div', { class: 'muted small' }, 'Dry run is on (top right). Untick it to delete for real.') : null),
