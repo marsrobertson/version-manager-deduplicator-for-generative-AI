@@ -222,6 +222,40 @@ test('autopilot: backs up, then removes copies and backed-up uploads, verifies, 
   } finally { await t.done(); }
 });
 
+test('backup safety: a preview-sized download or a file missing from the folder is never treated as backed up', async () => {
+  const t = await setup('known');
+  const { page } = t;
+  try {
+    let dialog = '';
+    page.on('dialog', d => { dialog = d.message(); d.accept(); });
+    await page.goto(t.mock.url);
+    await tid(page, 'gc-launcher').click();
+    await page.evaluate(() => { window.showDirectoryPicker = async () => navigator.storage.getDirectory(); });
+    const face = (await t.state()).files.find(f => f.name === 'face-ref.png');
+    // ChatGPT hands out something smaller than the original for this one upload.
+    await page.route(`**/files-cdn/${face.fileId}`, r => r.fulfill({ status: 200, contentType: 'image/png', body: Buffer.from('not the original') }));
+    await tid(page, 'gc-scan').click();
+    await tid(page, 'gc-backup').click();
+    const statusHas = re => page.waitForFunction(src => new RegExp(src).test(document.querySelector('#gencull-host').shadowRoot.querySelector('[data-testid=gc-status]')?.textContent || ''), re.source, { timeout: 60000 });
+    await statusHas(/Backup done: 32 of 33 .* 1 came back smaller/);
+    // Someone tidies the backup folder and removes one pasted image.
+    const removed = await page.evaluate(async () => {
+      const d = await (await navigator.storage.getDirectory()).getDirectoryHandle('Uploads and pastes');
+      for await (const n of d.keys()) if (/ image [0-9a-f]{8}\.png$/.test(n)) { await d.removeEntry(n); return n; }
+    });
+    assert.ok(removed);
+    await tid(page, 'gc-dryrun').uncheck();
+    await tid(page, 'gc-autopilot').click();
+    await statusHas(/Autopilot done/);
+    assert.match(dialog, /delete 11 files/);
+    const s = await t.state();
+    assert.equal(s.files.length, 23);
+    assert.ok(s.files.some(f => f.name === 'face-ref.png'), 'the upload that only downloaded as a preview is kept');
+    assert.equal(s.files.filter(f => f.name === 'image.png').length, 1, 'the upload missing from the folder is kept');
+    assert.deepEqual(t.errors, []);
+  } finally { await t.done(); }
+});
+
 test('threads: delete a whole thread in one click, open its chat, download an image', async () => {
   const t = await setup('known');
   const { page } = t;
@@ -253,6 +287,24 @@ test('threads: delete a whole thread in one click, open its chat, download an im
       return new Promise(r => { const c = db.transaction('thumbs').objectStore('thumbs').count(); c.onsuccess = () => r(c.result >= 5); });
     }, null, { timeout: 20000 });
     await page.screenshot({ path: join(SHOTS, 'threads.png') });
+    // Find a chat by title, and sort.
+    await page.getByRole('button', { name: '← All series' }).click();
+    await tid(page, 'gc-series-search').fill('album');
+    assert.equal(await tid(page, 'gc-series-row').count(), 1);
+    await tid(page, 'gc-series-search').fill('');
+    await tid(page, 'gc-series-sort').selectOption('new');
+    assert.match(await tid(page, 'gc-series-row').first().textContent(), /Logo sketch/);
+    // Coming back later: the last scan is shown at once, and deleting rescans first.
+    await page.waitForTimeout(400);
+    await page.reload();
+    await tid(page, 'gc-launcher').click();
+    await page.getByText('This is your last scan').waitFor();
+    assert.equal(await tileNum(page, 'gc-tile-total'), 34);
+    await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 8 files' }).waitFor();
+    await tid(page, 'gc-delete-open').click();
+    await page.getByText('This is your last scan').waitFor({ state: 'detached' });
+    await page.waitForFunction(() => /Storage source/.test(document.querySelector('#gencull-host').shadowRoot.querySelector('[data-testid=gc-log]').textContent));
+    await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 8 files' }).waitFor();
     assert.deepEqual(t.errors, []);
   } finally { await t.done(); }
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GenCull: ChatGPT storage deduplicator
 // @namespace    https://github.com/marsrobertson/version-manager-deduplicator-for-generative-AI
-// @version      0.6.0
+// @version      0.7.0
 // @description  Find repeat uploads and reference images in ChatGPT storage, cull failed generations, free up your quota. Runs locally in your ChatGPT tab.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -1164,17 +1164,24 @@ const GCNet = (() => {
     return null;
   }
 
-  /** Raw bytes of an item's image, smallest known rendition first. */
-  async function imageBlob(item, { signal, full = false } = {}) {
+  /**
+   * Raw bytes of an item's image, smallest known rendition first.
+   * With expectSize, keeps trying sources until one has exactly that many
+   * bytes (the original), and otherwise returns the biggest one it found.
+   */
+  async function imageBlob(item, { signal, full = false, expectSize = 0 } = {}) {
     const urls = full ? [item.url, item.genUrl] : [item.thumbUrl, item.genThumbUrl, item.genUrl, item.url];
     if (item.fileId) urls.push(`/backend-api/files/download/${encodeURIComponent(item.fileId)}`, `/backend-api/files/${encodeURIComponent(item.fileId)}/download`);
-    for (const u of urls.filter(Boolean)) {
+    let best = null;
+    for (const u of [...new Set(urls.filter(Boolean))]) {
       try {
         const blob = await fetchImage(u, signal);
-        if (blob && blob.size) return blob;
+        if (!blob || !blob.size) continue;
+        if (!expectSize || blob.size === expectSize) return blob;
+        if (!best || blob.size > best.size) best = blob;
       } catch (e) { if (e.name === 'AbortError') throw e; }
     }
-    return null;
+    return best;
   }
 
   // ------------------------------------------------------------- deleting ----
@@ -1267,7 +1274,7 @@ const GCNet = (() => {
 const GCApp = (() => {
   'use strict';
   const C = GCCore, N = GCNet, S = GCStore;
-  const VERSION = '0.6.0';
+  const VERSION = '0.7.0';
   const fmt = C.formatBytes;
   const num = n => Number(n || 0).toLocaleString();
 
@@ -1334,22 +1341,34 @@ const GCApp = (() => {
   let saveTimer = null;
   function saveMarks() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => S.set('kv', 'marks', [...st.marks.entries()]), 400);
+    saveTimer = setTimeout(flushMarks, 150);
   }
+  function flushMarks() { clearTimeout(saveTimer); S.set('kv', 'marks', [...st.marks.entries()]); }
+  // Closing or reloading the tab right after a click must not lose that click.
+  window.addEventListener('pagehide', () => { if (st.marks.size) flushMarks(); });
   async function loadMarks() {
     const saved = await S.get('kv', 'marks');
     if (Array.isArray(saved)) st.marks = new Map(saved);
     const backed = await S.get('kv', 'backedUp');
-    if (Array.isArray(backed)) st.backedUp = new Set(backed);
+    // key -> "folder/file" in the backup folder. (v0.6 saved bare keys: those get re-checked.)
+    if (Array.isArray(backed)) st.backedUp = new Map(backed.map(e => Array.isArray(e) ? e : [e, '']));
+    st.bkDir = await S.get('kv', 'backupDir') || null;
   }
 
   // ------------------------------------------------------------- backup ----
 
-  st.backedUp = new Set();
+  st.backedUp = new Map();
+  const saveBackedUp = () => S.set('kv', 'backedUp', [...st.backedUp]);
   const safeName = (t, max = 80) => String(t || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, max) || 'untitled';
   const extOf = it => (it.mime && it.mime.split('/')[1]?.replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')) || (it.name.match(/\.([a-z0-9]{2,5})$/i)?.[1]) || 'png';
   /** Uploads not saved to your computer yet: Autopilot will not delete these. */
   const refsNeedingBackup = () => (st.cls?.trustAbsence ? C.planAllReferences(st.items) : []).filter(k => !st.backedUp.has(k));
+
+  /** Where an item lives in the backup folder. Once saved it stays put, even if the chat is renamed later. */
+  function pathFor(it, titles) {
+    const saved = st.backedUp.get(it.key);
+    return saved ? [saved.slice(0, saved.indexOf('/')), saved.slice(saved.indexOf('/') + 1)] : backupPath(it, titles);
+  }
 
   function backupPath(it, titles) {
     const folder = it.conversationId ? safeName(`${titles.get(it.conversationId) || 'Chat'} (${it.conversationId.slice(0, 8)})`)
@@ -1362,6 +1381,21 @@ const GCApp = (() => {
     return [folder, `${date} ${base} ${hsh.toString(16).padStart(8, '0')}.${extOf(it)}`];
   }
 
+  /** A saved file counts only if it has exactly the bytes ChatGPT lists: a preview or a cut-off download does not. */
+  const sizeOk = (it, bytes) => bytes > 0 && (!it.size || bytes === it.size);
+  async function savedSize(dir, path) {
+    try {
+      const [folder, file] = path;
+      const fh = await (await dir.getDirectoryHandle(folder)).getFileHandle(file);
+      return (await fh.getFile()).size;
+    } catch { return 0; }
+  }
+  const eta = (startedAt, done, total) => {
+    if (done < 5 || done >= total) return '';
+    const sec = (Date.now() - startedAt) / done * (total - done) / 1000;
+    return sec > 5400 ? `, about ${Math.round(sec / 3600)} h left` : sec > 90 ? `, about ${Math.round(sec / 60)} min left` : ', about a minute left';
+  };
+
   /**
    * Save images into a folder you pick, one subfolder per chat. Files that
    * are already there are skipped, so an interrupted backup can be resumed.
@@ -1370,47 +1404,75 @@ const GCApp = (() => {
     if (!window.showDirectoryPicker) { status('Saving to a folder needs Chrome or Edge.'); log('Backup needs the File System Access API (Chrome or Edge).'); return false; }
     let dir;
     try { dir = await window.showDirectoryPicker({ mode: 'readwrite', id: 'gencull-backup' }); } catch { status('Backup cancelled.'); return false; }
+    st.bkDir = dir; S.set('kv', 'backupDir', dir);
     const titles = new Map(st.series.map(x => [x.id, x.title]));
     const targets = st.items.filter(it => it.image && (st.backupHistory || it.fromLibrary));
-    st.bk = { running: true, done: 0, saved: 0, skipped: 0, failed: 0, total: targets.length, abort: new AbortController() };
+    st.bk = { running: true, done: 0, saved: 0, skipped: 0, failed: 0, partial: 0, bytes: 0, total: targets.length, startedAt: Date.now(), abort: new AbortController() };
     render();
     const rows = [['folder', 'file', 'kind', 'size', 'created', 'chat', 'prompt']];
     const dirs = new Map();
     const sub = async name => { if (!dirs.has(name)) dirs.set(name, dir.getDirectoryHandle(name, { create: true })); return dirs.get(name); };
     try {
       await pool(targets, 3, async it => {
-        const [folder, file] = backupPath(it, titles);
+        const path = pathFor(it, titles);
+        const [folder, file] = path;
         try {
           const d = await sub(folder);
-          let exists = false;
-          try { const fh = await d.getFileHandle(file); exists = (await fh.getFile()).size > 0; } catch { /* not there yet */ }
-          if (exists) st.bk.skipped++;
+          if (sizeOk(it, await savedSize(dir, path))) st.bk.skipped++;
           else {
-            const blob = await N.imageBlob(it, { full: true, signal: st.bk.abort.signal });
-            if (!blob) { st.bk.failed++; return; }
+            const blob = await N.imageBlob(it, { full: true, expectSize: it.size || 0, signal: st.bk.abort.signal });
+            if (!blob) { st.bk.failed++; st.backedUp.delete(it.key); return; }
             const w = await (await d.getFileHandle(file, { create: true })).createWritable();
             await w.write(blob); await w.close();
+            st.bk.bytes += blob.size;
+            if (!sizeOk(it, blob.size)) {
+              // Saved what ChatGPT gave, but it is not the listed original: never treat it as a backup.
+              st.bk.partial++; st.backedUp.delete(it.key);
+              if (st.bk.partial <= 5) log(`Backup: "${it.name || it.key}" downloaded as ${fmt(blob.size)} but ChatGPT lists ${fmt(it.size)}. Saved, but not counted as backed up.`);
+              return;
+            }
             st.bk.saved++;
           }
-          st.backedUp.add(it.key);
+          st.backedUp.set(it.key, path.join('/'));
           rows.push([folder, file, it.kind, it.size || '', it.created ? new Date(it.created).toISOString() : '', it.conversationId ? `${location.origin}/c/${it.conversationId}` : '', (it.prompt || '').replace(/\s+/g, ' ')]);
         } catch (e) { if (e.name === 'AbortError') throw e; st.bk.failed++; }
         finally {
-          st.bk.done++;
-          if (st.bk.done % 10 === 0 || st.bk.done === st.bk.total) { status(`Backup: ${num(st.bk.done)} / ${num(st.bk.total)} (${num(st.bk.saved)} saved, ${num(st.bk.skipped)} already there, ${num(st.bk.failed)} failed)`); S.set('kv', 'backedUp', [...st.backedUp]); }
+          const b = st.bk; b.done++;
+          if (b.done % 10 === 0 || b.done === b.total) { status(`Backup: ${num(b.done)} / ${num(b.total)} (${fmt(b.bytes)} downloaded, ${num(b.skipped)} already there, ${num(b.failed + b.partial)} failed${eta(b.startedAt, b.done, b.total)})`); saveBackedUp(); }
         }
       }, st.bk.abort.signal);
       const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
       const w = await (await dir.getFileHandle('index.csv', { create: true })).createWritable();
       await w.write(csv); await w.close();
     } finally {
-      S.set('kv', 'backedUp', [...st.backedUp]);
+      saveBackedUp();
       const b = st.bk; b.running = false;
-      log(`Backup finished: ${num(b.saved)} saved, ${num(b.skipped)} already there, ${num(b.failed)} failed, of ${num(b.total)}.`);
-      status(`Backup done: ${num(b.saved + b.skipped)} of ${num(b.total)} images are in your folder${b.failed ? `, ${num(b.failed)} failed (run again to retry)` : ''}.`);
+      log(`Backup finished: ${num(b.saved)} saved (${fmt(b.bytes)}), ${num(b.skipped)} already there, ${num(b.failed)} failed, ${num(b.partial)} not the full original, of ${num(b.total)}.`);
+      status(`Backup done: ${num(b.saved + b.skipped)} of ${num(b.total)} images are in your folder${b.failed ? `, ${num(b.failed)} failed (run again to retry)` : ''}${b.partial ? `, ${num(b.partial)} came back smaller than the original and do not count` : ''}.`);
       render();
     }
     return true;
+  }
+
+  /**
+   * Just before deleting: look into the backup folder and keep only the
+   * uploads whose saved file is really there with the right size.
+   */
+  async function verifyBackedUp(keys) {
+    const dir = st.bkDir;
+    if (!keys.length) return { ok: [], reason: '' };
+    if (!dir) return { ok: [], reason: 'no backup folder is known in this browser' };
+    try {
+      if (dir.queryPermission && await dir.queryPermission({ mode: 'read' }) !== 'granted') return { ok: [], reason: 'the browser did not allow reading the backup folder' };
+    } catch { return { ok: [], reason: 'the backup folder could not be opened' }; }
+    const titles = new Map(st.series.map(x => [x.id, x.title]));
+    const ok = [];
+    await pool(keys, 8, async k => {
+      const it = st.byKey.get(k);
+      if (sizeOk(it, await savedSize(dir, pathFor(it, titles)))) ok.push(k); else st.backedUp.delete(k);
+    });
+    saveBackedUp();
+    return { ok, reason: '' };
   }
 
   const markOf = key => st.marks.get(key)?.m;
@@ -1475,6 +1537,9 @@ const GCApp = (() => {
       derive();
       st.lookalikes = null;
       st.scannedAt = Date.now();
+      st.fromCache = false;
+      // Remember the scan, so pasting GenCull again tomorrow opens straight away.
+      S.set('kv', 'scan', { at: st.scannedAt, items: st.items, cls: st.cls, genInfo: st.genInfo, libInfo: st.libInfo });
       // Forget marks for files that are gone.
       for (const k of [...st.marks.keys()]) if (!st.byKey.has(k)) st.marks.delete(k);
       saveMarks();
@@ -1488,6 +1553,19 @@ const GCApp = (() => {
       render();
     }
   }
+
+  /** Bring back the last scan from this browser (at most a week old). Deleting always works on a fresh scan. */
+  async function restoreScan() {
+    const c = await S.get('kv', 'scan');
+    if (!c || !Array.isArray(c.items) || !c.items.length || Date.now() - c.at > 7 * 864e5 || st.scannedAt || st.scanning) return;
+    st.items = c.items; st.cls = c.cls; st.genInfo = c.genInfo; st.libInfo = c.libInfo;
+    st.hashes = await S.getMany('hashes', st.items.map(it => it.key));
+    derive();
+    st.scannedAt = c.at; st.fromCache = true;
+    log(`Showing your last scan (${ago(c.at)}). Press Rescan for the current state.`);
+    render();
+  }
+  const ago = t => { const m = Math.round((Date.now() - t) / 60000); return m < 2 ? 'just now' : m < 90 ? `${m} minutes ago` : m < 2880 ? `${Math.round(m / 60)} hours ago` : `${Math.round(m / 1440)} days ago`; };
 
   // ---------------------------------------------------------- thumbnails ----
 
@@ -1798,6 +1876,8 @@ const GCApp = (() => {
   function startDelete() {
     const all = queued();
     if (!all.length) return;
+    // Never delete from a remembered scan: read the current state first.
+    if (st.fromCache) { if (!st.scanning) scan().then(() => { if (!st.fromCache) startDelete(); }); return; }
     const { plan, impossible } = N.planDeletes(all);
     // Deletable items first, so the one-file test run uses a file that can be deleted.
     const items = [...[...plan.values()].flat(), ...impossible];
@@ -1821,6 +1901,7 @@ const GCApp = (() => {
       saveMarks();
       derive();
       if (st.lookalikes) st.lookalikes = st.lookalikes.map(g => g.filter(it => !gone.has(it.key))).filter(g => g.length > 1);
+      S.set('kv', 'scan', { at: st.scannedAt, items: st.items, cls: st.cls, genInfo: st.genInfo, libInfo: st.libInfo });
     }
     return res;
   }
@@ -1866,6 +1947,8 @@ const GCApp = (() => {
     if (st.scanning || st.del?.phase === 'running' || st.auto) return;
     st.open = true;
     st.auto = true;
+    // Ask for the backup folder now, while the click still counts as your permission.
+    try { if (st.bkDir?.requestPermission) await st.bkDir.requestPermission({ mode: 'read' }); } catch { /* checked again later */ }
     try { await runAutopilot(); } finally { st.auto = false; updateLauncher(); render(); }
   }
 
@@ -1877,14 +1960,18 @@ const GCApp = (() => {
     if (st.groups.some(g => !g.confident)) { status('Autopilot: checking contents of same-name, same-size files…'); await checkDoubtfulGroups(); }
     const extras = new Set(C.planExtraCopies(st.groups));
     // Uploads are only deleted once they are saved on your computer.
+    const claimed = (st.cls?.trustAbsence ? C.planAllReferences(st.items) : []).filter(k => st.backedUp.has(k));
+    if (claimed.length) status('Autopilot: checking your backup folder…');
+    const checked = await verifyBackedUp(claimed);
+    const refs = checked.ok;
+    if (claimed.length > refs.length) log(`Autopilot: ${num(claimed.length - refs.length)} uploads were not found in your backup folder${checked.reason ? ` (${checked.reason})` : ''}, so they are left alone. Press "Back up library to a folder…" and pick the same folder: it only downloads what is missing.`);
     const notBacked = refsNeedingBackup();
-    const refs = (st.cls?.trustAbsence ? C.planAllReferences(st.items) : []).filter(k => st.backedUp.has(k));
     const keys = [...new Set([...extras, ...refs])].filter(k => markOf(k) !== 'keep');
     if (!keys.length) { log('Autopilot: nothing safe to delete automatically.'); status('Autopilot: nothing safe to delete.'); return; }
     const bytes = keys.reduce((t, k) => t + (st.byKey.get(k)?.size || 0), 0);
     const msg = `GenCull autopilot\n\n${st.dryRun ? 'DRY RUN (nothing is sent): ' : ''}delete ${num(keys.length)} files, ${fmt(bytes)}:\n` +
       `• ${num(extras.size)} extra copies (one copy of each file is kept)\n` +
-      `• ${st.cls?.trustAbsence ? `${num(refs.length)} uploaded or pasted images that are backed up in your folder` : 'uploads skipped: upload/generation split is uncertain'}\n` +
+      `• ${st.cls?.trustAbsence ? `${num(refs.length)} uploaded or pasted images that I just found in your backup folder` : 'uploads skipped: upload/generation split is uncertain'}\n` +
       (notBacked.length ? `• ${num(notBacked.length)} uploads are NOT backed up yet and are left alone\n` : '') + '\n' +
       'Generations are not touched. A list of the files downloads first, and one test file is deleted and verified before the rest.\n\nContinue?';
     if (!window.confirm(msg)) { log('Autopilot cancelled.'); return; }
@@ -1941,7 +2028,7 @@ const GCApp = (() => {
       log(what === 'delete' ? 'Learned how your ChatGPT deletes a file.' : what === 'list' ? 'Learned a storage listing request.' : 'Forgot learned requests.');
       if (st.open && st.tab === 'setup') render();
     });
-    loadMarks().then(render);
+    loadMarks().then(restoreScan).then(render);
   }
 
   function render() {
@@ -2060,7 +2147,7 @@ const GCApp = (() => {
     return h('div', { class: 'facts' },
       h('div', {}, `Generated-images history: ${g.error ? `unavailable (${g.error})` : `${num(g.count)} images, ${g.complete ? 'read to the end' : 'INCOMPLETE'}, ${num(g.linked)} matched to storage entries`}`),
       h('div', {}, `Storage listing: ${l.needsTeaching ? 'not found (see Setup)' : `${num(l.count)} entries, ${l.complete ? 'read to the end' : 'INCOMPLETE'}`}`),
-      h('div', { class: 'muted' }, `Scanned ${new Date(st.scannedAt).toLocaleString()}.`));
+      h('div', { class: st.fromCache ? 'warn' : 'muted' }, st.fromCache ? `This is your last scan, from ${ago(st.scannedAt)}. Press Rescan to see the current state.` : `Scanned ${new Date(st.scannedAt).toLocaleString()}.`));
   }
 
   function refGroupsForView() {
@@ -2129,7 +2216,11 @@ const GCApp = (() => {
     const s = st.openSeries && st.series.find(x => x.id === st.openSeries);
     if (!s) {
       // Threads that take up storage, biggest first. History-only ones cannot be deleted from storage anyway.
-      const all = st.series.filter(x => st.showHistoryOnly || x.stored);
+      const words = (st.seriesQuery || '').toLowerCase().split(/\s+/).filter(Boolean);
+      const last = x => x.items[x.items.length - 1]?.created || 0;
+      const order = { size: null, new: (a, b) => last(b) - last(a), count: (a, b) => b.stored - a.stored }[st.seriesSort || 'size'];
+      const all = st.series.filter(x => (st.showHistoryOnly || x.stored) && words.every(w => `${x.title} ${x.id}`.toLowerCase().includes(w)));
+      if (order) all.sort(order);
       const deletable = x => x.items.filter(it => it.fromLibrary && markOf(it.key) !== 'keep');
       const list = h('div', { class: 'rows' });
       for (const x of all.slice(0, st.seriesLimit || 200)) {
@@ -2145,9 +2236,14 @@ const GCApp = (() => {
             : btn('Delete whole thread', e => { e.stopPropagation(); setMark(del.map(it => it.key), 'reject', 'whole thread'); render(); }, { disabled: !del.length, 'data-testid': 'gc-thread-delete' })));
       }
       const wrap = h('div', {},
-        h('div', { class: 'note' }, 'One row per chat, biggest first. "Delete whole thread" queues every image of that chat that is in storage (starred ones excepted). Click a row to pick images one by one. Then press Delete… at the bottom.'),
+        h('div', { class: 'note' }, 'One row per chat. "Delete whole thread" queues every image of that chat that is in storage (starred ones excepted). Click a row to pick images one by one. Then press Delete… at the bottom.'),
+        h('div', { class: 'bar' },
+          h('input', { type: 'search', class: 'search', placeholder: 'Find a chat by title…', value: st.seriesQuery || '', 'data-testid': 'gc-series-search',
+            oninput: e => { st.seriesQuery = e.target.value; st.seriesLimit = 200; render(); const el = root.querySelector('[data-testid=gc-series-search]'); el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); } }),
+          h('select', { 'data-testid': 'gc-series-sort', onchange: e => { st.seriesSort = e.target.value; render(); } },
+            [['size', 'Biggest first'], ['new', 'Newest first'], ['count', 'Most images first']].map(([v, t]) => h('option', { value: v, selected: (st.seriesSort || 'size') === v }, t)))),
         h('label', { class: 'unlock' }, h('input', { type: 'checkbox', checked: !!st.showHistoryOnly, onchange: e => { st.showHistoryOnly = e.target.checked; render(); } }), ' Also show chats whose images are only in history'),
-        h('div', { class: 'muted small' }, `${plural(all.length, 'chat')}.`),
+        h('div', { class: 'muted small' }, `${plural(all.length, 'chat')}, ${fmt(all.reduce((t, x) => t + x.storedBytes, 0))} in storage.`),
         list);
       if (all.length > (st.seriesLimit || 200)) wrap.append(btn(`Show more (${num(all.length - (st.seriesLimit || 200))} left)`, () => { st.seriesLimit = (st.seriesLimit || 200) + 300; render(); }));
       return wrap;
@@ -2375,7 +2471,8 @@ button.ghost { background: none; }
 button.icon { padding: 4px 8px; }
 button.big { padding: 9px 16px; font-size: 14px; }
 .toggle { display: flex; align-items: center; gap: 4px; color: #c9cad3; font-size: 12px; cursor: pointer; }
-input[type=text], select { font: inherit; color: #e8e8ec; background: #1b1c20; border: 1px solid #3a3b41; border-radius: 6px; padding: 4px 8px; }
+input.search { flex: 1; min-width: 140px; }
+input[type=text], input[type=search], select { font: inherit; color: #e8e8ec; background: #1b1c20; border: 1px solid #3a3b41; border-radius: 6px; padding: 4px 8px; }
 h3 { font-size: 13px; margin: 16px 0 8px; color: #fff; }
 p { margin: 8px 0; }
 .muted { color: #8b8d98; } .small { font-size: 12px; }

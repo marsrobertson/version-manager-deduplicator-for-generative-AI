@@ -321,17 +321,24 @@ const GCNet = (() => {
     return null;
   }
 
-  /** Raw bytes of an item's image, smallest known rendition first. */
-  async function imageBlob(item, { signal, full = false } = {}) {
+  /**
+   * Raw bytes of an item's image, smallest known rendition first.
+   * With expectSize, keeps trying sources until one has exactly that many
+   * bytes (the original), and otherwise returns the biggest one it found.
+   */
+  async function imageBlob(item, { signal, full = false, expectSize = 0 } = {}) {
     const urls = full ? [item.url, item.genUrl] : [item.thumbUrl, item.genThumbUrl, item.genUrl, item.url];
     if (item.fileId) urls.push(`/backend-api/files/download/${encodeURIComponent(item.fileId)}`, `/backend-api/files/${encodeURIComponent(item.fileId)}/download`);
-    for (const u of urls.filter(Boolean)) {
+    let best = null;
+    for (const u of [...new Set(urls.filter(Boolean))]) {
       try {
         const blob = await fetchImage(u, signal);
-        if (blob && blob.size) return blob;
+        if (!blob || !blob.size) continue;
+        if (!expectSize || blob.size === expectSize) return blob;
+        if (!best || blob.size > best.size) best = blob;
       } catch (e) { if (e.name === 'AbortError') throw e; }
     }
-    return null;
+    return best;
   }
 
   // ------------------------------------------------------------- deleting ----

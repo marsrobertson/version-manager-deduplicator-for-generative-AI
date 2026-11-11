@@ -4,7 +4,7 @@
 
 *Cull* is the photographer's word for throwing out the bad shots so the good ones are easy to find.
 
-> **Status: v0.1, not yet tried on a real account.** ChatGPT has no public API for storage, so GenCull uses the same internal requests the ChatGPT website uses. It has been tested end to end against a fake ChatGPT server built from what other open-source tools report (see [Testing](#testing)). Follow the [first-run checklist](#first-run-checklist): dry run first, then delete one test file.
+> **Status: v0.7.** ChatGPT has no public API for storage, so GenCull uses the same internal requests the ChatGPT website uses. Scanning has worked on one real account (7,410 files, 16.6 GB). Backup and deleting are so far tested only against a fake ChatGPT server (see [Testing](#testing)). Follow the [first-run checklist](#first-run-checklist): dry run first, then delete one test file.
 
 ![Overview on test data](docs/screenshot-overview.png)
 
@@ -45,12 +45,14 @@ The storage page lets you delete one file at a time. With 10,000 images, that is
 
 Run it again any time: files already saved are skipped, so an interrupted backup resumes. It needs Chrome or Edge, because Firefox and Safari can't write to a folder.
 
+A file counts as backed up only if the saved file has **exactly the byte size ChatGPT lists**. If ChatGPT returns something smaller (a preview, or a cut-off download), the file is still saved but GenCull does not treat it as a backup. Limit: if the listing gives no size for a file, this check cannot be made for that file.
+
 ## Autopilot (least effort)
 
 Untick **Dry run** and press **Autopilot: remove copies & references**. It runs entirely in your browser and needs no Claude tokens:
 
 1. Scans your storage.
-2. Queues only the safe deletions: extra copies (one copy always stays), plus uploaded or pasted images **that GenCull has already saved to your computer** with **Back up library**. Uploads that are not backed up are never deleted by Autopilot.
+2. Queues only the safe deletions: extra copies (one copy always stays), plus uploaded or pasted images **that GenCull has already saved to your computer** with **Back up library**. Just before deleting, it opens the backup folder again and checks that each of those files is really there with the right size. Anything it cannot find is left alone (moved or renamed backup folders count as "not found").
 3. Shows one confirmation with the counts, then downloads the list of files.
 4. Deletes one test file and re-reads the storage listing to prove it is gone. If it is still listed, autopilot pauses.
 5. Deletes the rest, then rescans and reports the space freed.
@@ -89,7 +91,9 @@ GenCull is a *userscript*: a small program that runs inside the chatgpt.com tab,
 5. **Check.** Open Settings → Storage in another tab: the image count should have dropped by one. If it did, press **Continue**.
 6. **Rescan** when done. OpenAI says deleted files are permanently removed within 30 days. Whether your quota counter drops at once or later is one of the [things I could not check](#what-is-not-verified).
 
-Then do the same with **references**, then work through **Series** at your own pace. Your stars and rejects are saved in the browser, so you can stop and come back later.
+Then do the same with **references**, then work through **Series** at your own pace: find a chat by title, sort by size, date or image count, and delete a whole thread in one click.
+
+Your stars, rejects and the last scan are saved in the browser. When you open GenCull again it shows that scan at once (marked with its age), and it always rescans before deleting anything.
 
 ## How it decides
 
@@ -99,7 +103,7 @@ Then do the same with **references**, then work through **Series** at your own p
 |---|---|---|
 | The file id appears in your generated-images history | generation | high |
 | The listing marks it as generated (e.g. a `source` field) | generation | medium |
-| Not in the history, **and** the history was read to the end, **and** at least 80% of the history matched storage entries | upload | high |
+| Not in the history, **and** the history was read to the end, **and** matching clearly works (at least 20 history images matched storage entries, or 80% of them) | upload | high |
 | Not in the history, but the history was incomplete or poorly matched | upload? | low |
 | No history available | unknown | low |
 
@@ -141,7 +145,7 @@ The sketches are cached in your browser. Fingerprinting may need to download eac
 
 ## What is not verified
 
-I could not log in to a real ChatGPT account while building this. These points are open:
+I cannot log in to a real ChatGPT account from where this is built. These points are open:
 
 1. **The exact endpoints on your account.** Built in as fallbacks:
    - Listing: `POST /backend-api/files/library`, reported by [sand7000/chat-gpt-bulk-delete](https://github.com/sand7000/chat-gpt-bulk-delete).
@@ -158,8 +162,8 @@ I could not log in to a real ChatGPT account while building this. These points a
 
 ```bash
 npm install           # installs playwright-core (for the browser tests only)
-npm test              # 19 unit tests: parsing, classification, duplicates, dHash, request learning
-npm run test:e2e      # builds, then runs 4 browser tests in Chromium against a fake ChatGPT
+npm test              # 20 unit tests: parsing, classification, duplicates, dHash, request learning
+npm run test:e2e      # builds, then runs 6 browser tests in Chromium against a fake ChatGPT
 npm run mock -- learn # run the fake ChatGPT at http://127.0.0.1:8787 (modes: known, learn, nogen)
 ```
 
@@ -167,7 +171,9 @@ The browser tests cover:
 - **known:** the reported endpoints.
 - **learn:** the reported endpoints are gone, and GenCull must learn unusual ones (`page_token` paging, `DELETE /library/v2/items/:id`) by watching the fake storage page.
 - **nogen:** no generated-images history, so bulk reference removal must stay locked and copy removal must keep the original generation.
-- **autopilot:** one click removes copies and references, verifies the test delete, and leaves every generation and the PDF alone.
+- **autopilot:** backs up, then one click removes copies and backed-up uploads, verifies the test delete, and leaves every generation and the PDF alone.
+- **backup safety:** an upload that downloads smaller than listed, and one whose file was removed from the backup folder, are both kept.
+- **threads:** whole-thread delete, search and sort, download, full-size viewer, and reopening from the saved scan.
 
 ## Code layout
 
