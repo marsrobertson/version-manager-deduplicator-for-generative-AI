@@ -1647,18 +1647,21 @@ const GCApp = (() => {
   }
 
   // Per-image actions: open its chat, download the original.
+  const chatUrl = it => it.conversationId ? `/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}` : null;
+  const chatLink = (it, label, props = {}) => chatUrl(it) ? h('a', { href: chatUrl(it), target: '_blank', rel: 'noopener', title: 'Open the chat this image is from (new tab)', onclick: e => e.stopPropagation(), ...props }, label) : null;
+
   function tileActions(it) {
     const stop = fn => e => { e.stopPropagation(); fn(); };
     const m = markOf(it.key);
     return h('div', { class: 'tacts' },
       h('button', { type: 'button', class: `tact ${m === 'reject' ? 'on' : ''}`, title: m === 'reject' ? 'Unqueue' : 'Queue for deletion', 'data-testid': 'gc-reject', onclick: stop(() => { setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you'); render(); }) }, '✕'),
-      it.conversationId ? h('a', { class: 'tact', href: `/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, target: '_blank', rel: 'noopener', title: 'Open the chat this image is from', onclick: e => e.stopPropagation() }, '↗') : null,
-      h('button', { type: 'button', class: 'tact', title: 'Download full-size image', 'data-testid': 'gc-download', onclick: stop(() => downloadImage(it)) }, '⬇'));
+      chatLink(it, '↗ chat', { class: 'tact' }),
+      h('button', { type: 'button', class: 'tact', title: 'Download full-size image', 'data-testid': 'gc-download', onclick: stop(() => downloadImage(it)) }, '⬇ save'));
   }
 
   async function downloadImage(it) {
     status(`Downloading ${it.name || 'image'}…`);
-    const blob = await N.imageBlob(it, { full: true });
+    const blob = await fullBlob(it); // instant if the image is open in the viewer
     if (!blob) { status('Download failed: ChatGPT did not return the image.'); return; }
     const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
     const base = (it.name || it.title || it.fileId || 'image').replace(/[\\/:*?"<>|]+/g, '_').replace(/\.[a-z0-9]{2,5}$/i, '');
@@ -1674,7 +1677,9 @@ const GCApp = (() => {
   const fullCache = new Map(); // key -> Promise<Blob|null>, last few only
   function fullBlob(it) {
     if (!fullCache.has(it.key)) {
-      fullCache.set(it.key, N.imageBlob(it, { full: true }).catch(() => null));
+      const p = N.imageBlob(it, { full: true }).catch(() => null);
+      p.then(b => { if (!b && fullCache.get(it.key) === p) fullCache.delete(it.key); }); // a failure can be retried
+      fullCache.set(it.key, p);
       while (fullCache.size > 8) fullCache.delete(fullCache.keys().next().value);
     }
     return fullCache.get(it.key);
@@ -1707,7 +1712,7 @@ const GCApp = (() => {
       x: () => { setMark([it.key], markOf(it.key) === 'reject' ? null : 'reject', 'rejected by you'); drawViewer(); },
       s: () => { setMark([it.key], markOf(it.key) === 'keep' ? null : 'keep', 'kept by you'); drawViewer(); },
       d: () => downloadImage(it),
-      o: () => { if (it.conversationId) window.open(`/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, '_blank', 'noopener'); },
+      o: () => { if (chatUrl(it)) window.open(chatUrl(it), '_blank', 'noopener'); },
     }[e.key.length === 1 ? e.key.toLowerCase() : e.key];
     if (!act) return;
     e.preventDefault(); e.stopPropagation(); // keep ChatGPT from typing these keys
@@ -1731,8 +1736,8 @@ const GCApp = (() => {
           btn('Next →', () => { v.idx = Math.min(v.list.length - 1, v.idx + 1); drawViewer(); }, { disabled: v.idx === v.list.length - 1 }),
           btn(m === 'reject' ? 'Unqueue (X)' : 'Delete (X)', () => { setMark([it.key], m === 'reject' ? null : 'reject', 'rejected by you'); drawViewer(); }, { class: m === 'reject' ? '' : 'danger', 'data-testid': 'gc-viewer-reject' }),
           btn(m === 'keep' ? 'Unstar (S)' : '★ Keep (S)', () => { setMark([it.key], m === 'keep' ? null : 'keep', 'kept by you'); drawViewer(); }),
-          btn('⬇ (D)', () => downloadImage(it)),
-          it.conversationId ? h('a', { class: 'link', href: `/c/${it.conversationId}${it.messageId ? `#${it.messageId}` : ''}`, target: '_blank', rel: 'noopener' }, 'Chat ↗ (O)') : null,
+          btn('⬇ Download (D)', () => downloadImage(it), { class: 'primary', 'data-testid': 'gc-viewer-download' }),
+          chatLink(it, 'Open chat ↗ (O)', { class: 'btnlink primary', 'data-testid': 'gc-viewer-chat' }),
           btn('Close (Esc)', closeViewer))),
       it.prompt ? h('div', { class: 'vprompt' }, it.prompt) : null,
       h('div', { class: 'vstage' }, cv));
@@ -1999,7 +2004,7 @@ const GCApp = (() => {
     const freed = d.results.filter(r => r.ok).reduce((t, r) => t + (r.item.size || 0), 0);
     await scan();
     log(`Autopilot done: freed ${fmt(freed)}.`);
-    status(`Autopilot done: freed ${fmt(freed)}. Next: cull generations in Series (manual).`);
+    status(`Autopilot done: freed ${fmt(freed)}. Next: cull generations in Threads (manual).`);
   }
 
   // -------------------------------------------------------------- render ----
@@ -2055,7 +2060,7 @@ const GCApp = (() => {
           ' Dry run'),
         btn('✕', () => { st.open = false; render(); }, { class: 'ghost icon', title: 'Close' })),
     );
-    const tabs = [['overview', 'Overview'], ['references', 'References'], ['series', 'Series'], ['lookalikes', 'Look-alikes'], ['queue', `Queue (${num(q.length)})`], ['setup', 'Setup']];
+    const tabs = [['overview', 'Overview'], ['references', 'References'], ['series', 'Threads'], ['lookalikes', 'Look-alikes'], ['queue', `Queue (${num(q.length)})`], ['setup', 'Setup']];
     const tabBar = h('div', { class: 'tabs' }, tabs.map(([id, label]) =>
       btn(label, () => { st.tab = id; render(); }, { class: st.tab === id ? 'tab on' : 'tab', 'data-testid': `gc-tab-${id}` })));
 
@@ -2201,6 +2206,8 @@ const GCApp = (() => {
           h('div', { class: 'muted small' },
             `${g.items.length > 1 ? `×${g.items.length} copies · ` : ''}${fmt(g.bytes)} · ${kinds} · ${g.items[0].confidence} confidence`,
             g.confident ? '' : ` · ${g.basis}`)),
+        chatLink(g.items[0], '↗', { class: 'btnlink' }),
+        btn('⬇', () => downloadImage(g.items[0]), { title: 'Download full-size image' }),
         h('div', { class: 'seg' },
           btn('Keep', () => setState('none'), { class: state === 'none' ? 'on' : '' }),
           g.items.length > 1 ? btn('Keep 1', () => setState('extras'), { class: state === 'extras' ? 'on' : '', disabled: !g.confident }) : null,
@@ -2219,7 +2226,8 @@ const GCApp = (() => {
       const words = (st.seriesQuery || '').toLowerCase().split(/\s+/).filter(Boolean);
       const last = x => x.items[x.items.length - 1]?.created || 0;
       const order = { size: null, new: (a, b) => last(b) - last(a), count: (a, b) => b.stored - a.stored }[st.seriesSort || 'size'];
-      const all = st.series.filter(x => (st.showHistoryOnly || x.stored) && words.every(w => `${x.title} ${x.id}`.toLowerCase().includes(w)));
+      const hay = x => (x.__hay ??= `${x.title} ${x.id} ${x.items.map(it => it.prompt || '').join(' ')}`.toLowerCase());
+      const all = st.series.filter(x => (st.showHistoryOnly || x.stored || words.length) && words.every(w => hay(x).includes(w)));
       if (order) all.sort(order);
       const deletable = x => x.items.filter(it => it.fromLibrary && markOf(it.key) !== 'keep');
       const list = h('div', { class: 'rows' });
@@ -2232,13 +2240,14 @@ const GCApp = (() => {
           h('div', { class: 'rmain' },
             h('div', { class: 'rname' }, x.title || (x.id === '(no conversation)' ? 'Not linked to a chat' : `Chat ${x.id.slice(0, 8)}`)),
             h('div', { class: 'muted small' }, `${num(x.stored)} in storage · ${fmt(x.storedBytes)}${x.items.length > x.stored ? ` · ${num(x.items.length - x.stored)} older not in storage` : ''}${rej ? ` · ✕ ${num(rej)} queued` : ''}`)),
+          x.id !== '(no conversation)' ? h('a', { href: `/c/${x.id}`, target: '_blank', rel: 'noopener', class: 'btnlink', 'data-testid': 'gc-row-chat', title: 'Open this chat (new tab)', onclick: e => e.stopPropagation() }, 'Open chat ↗') : null,
           whole ? btn('Undo', e => { e.stopPropagation(); setMark(del.map(it => it.key), null); render(); })
             : btn('Delete whole thread', e => { e.stopPropagation(); setMark(del.map(it => it.key), 'reject', 'whole thread'); render(); }, { disabled: !del.length, 'data-testid': 'gc-thread-delete' })));
       }
       const wrap = h('div', {},
         h('div', { class: 'note' }, 'One row per chat. "Delete whole thread" queues every image of that chat that is in storage (starred ones excepted). Click a row to pick images one by one. Then press Delete… at the bottom.'),
         h('div', { class: 'bar' },
-          h('input', { type: 'search', class: 'search', placeholder: 'Find a chat by title…', value: st.seriesQuery || '', 'data-testid': 'gc-series-search',
+          h('input', { type: 'search', class: 'search', placeholder: 'Find a chat by title or prompt…', value: st.seriesQuery || '', 'data-testid': 'gc-series-search',
             oninput: e => { st.seriesQuery = e.target.value; st.seriesLimit = 200; render(); const el = root.querySelector('[data-testid=gc-series-search]'); el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); } }),
           h('select', { 'data-testid': 'gc-series-sort', onchange: e => { st.seriesSort = e.target.value; render(); } },
             [['size', 'Biggest first'], ['new', 'Newest first'], ['count', 'Most images first']].map(([v, t]) => h('option', { value: v, selected: (st.seriesSort || 'size') === v }, t)))),
@@ -2274,8 +2283,8 @@ const GCApp = (() => {
     const rej = s.items.filter(it => markOf(it.key) === 'reject');
     return h('div', {},
       h('div', { class: 'bar' },
-        btn('← All series', () => { st.openSeries = null; st.lastClicked = null; render(); }),
-        s.id !== '(no conversation)' ? h('a', { href: `/c/${s.id}`, target: '_blank', rel: 'noopener', class: 'link' }, 'Open chat ↗') : null,
+        btn('← All threads', () => { st.openSeries = null; st.lastClicked = null; render(); }),
+        s.id !== '(no conversation)' ? h('a', { href: `/c/${s.id}`, target: '_blank', rel: 'noopener', class: 'btnlink primary' }, 'Open chat ↗') : null,
         btn('Reject all not starred', () => { setMark(s.items.filter(it => markOf(it.key) !== 'keep').map(it => it.key), 'reject', 'rejected by you'); render(); }, { 'data-testid': 'gc-reject-unstarred' }),
         btn('Clear marks', () => { setMark(s.items.map(it => it.key), null); render(); })),
       h('div', { class: 'muted small' }, `${s.title || s.id} · ${num(s.items.length)} images · ${num(rej.length)} rejected (${fmt(rej.reduce((t, it) => t + (it.size || 0), 0))}). Click = view full size (← → move, X delete, S keep, D download, O open chat). ✕ = queue, shift-click = queue a range, ☆ = keep.`),
@@ -2518,6 +2527,9 @@ p { margin: 8px 0; }
 .tacts { position: absolute; bottom: 24px; right: 7px; display: flex; gap: 4px; }
 .tact { font: 13px/1 system-ui, sans-serif; padding: 4px 7px; background: rgba(0,0,0,.65); border: none; border-radius: 6px; color: #fff; text-decoration: none; cursor: pointer; }
 .tact:hover { background: #2b5bd7; }
+a.btnlink { display: inline-block; padding: 5px 10px; border: 1px solid #3a3b41; border-radius: 7px; color: #e8e8ec; text-decoration: none; font-size: 13px; white-space: nowrap; }
+a.btnlink:hover { border-color: #8ab4ff; }
+a.btnlink.primary, a.btnlink.primary:hover { background: #2b5bd7; border-color: #2b5bd7; color: #fff; }
 .x { position: absolute; inset: 0; display: grid; place-items: center; font-size: 42px; color: #ff6b61; pointer-events: none; }
 .lgroup { border: 1px solid #2c2d33; border-radius: 10px; padding: 6px 8px; margin: 8px 0; }
 .delbox { border: 1px solid #28406e; background: #141b2b; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }

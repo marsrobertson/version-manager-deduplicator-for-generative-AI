@@ -94,6 +94,10 @@ test('known endpoints: scan, classify, dry run, delete references, cull a series
 
     // Cull the biggest series: star one keeper, reject the rest.
     await tid(page, 'gc-tab-series').click();
+    assert.equal(await tid(page, 'gc-row-chat').first().getAttribute('href'), '/c/conv-aaaa-1111');
+    await tid(page, 'gc-series-search').fill('take 3');
+    assert.equal(await tid(page, 'gc-series-row').count(), 3, 'search finds chats by prompt');
+    await tid(page, 'gc-series-search').fill('');
     await tid(page, 'gc-series-row').first().click();
     const tiles = tid(page, 'gc-gen-tile');
     assert.equal(await tiles.count(), 10);
@@ -266,6 +270,10 @@ test('threads: delete a whole thread in one click, open its chat, download an im
     await tid(page, 'gc-tab-series').click();
     await tid(page, 'gc-thread-delete').first().click();
     await tid(page, 'gc-queue-summary').filter({ hasText: 'Queued for deletion: 10 files' }).waitFor();
+    assert.equal(await tid(page, 'gc-row-chat').first().getAttribute('href'), '/c/conv-aaaa-1111');
+    await tid(page, 'gc-series-search').fill('take 3');
+    assert.equal(await tid(page, 'gc-series-row').count(), 3, 'search finds chats by prompt');
+    await tid(page, 'gc-series-search').fill('');
     await tid(page, 'gc-series-row').first().click();
     const tile = tid(page, 'gc-gen-tile').first();
     assert.match(await tile.locator('a.tact').getAttribute('href'), /^\/c\/conv-aaaa-1111#msg-/);
@@ -276,6 +284,10 @@ test('threads: delete a whole thread in one click, open its chat, download an im
     await tile.click();
     await tid(page, 'gc-viewer').waitFor();
     await page.waitForFunction(() => document.querySelector('#gencull-host').shadowRoot.querySelector('.vcanvas')?.width === 96);
+    assert.match(await tid(page, 'gc-viewer-chat').getAttribute('href'), /^\/c\/conv-aaaa-1111#msg-/);
+    const dl2 = page.waitForEvent('download');
+    await tid(page, 'gc-viewer-download').click();
+    assert.match((await dl2).suggestedFilename(), /\.png$/);
     await page.keyboard.press('x');
     await page.keyboard.press('ArrowRight');
     await page.keyboard.press('x');
@@ -288,7 +300,7 @@ test('threads: delete a whole thread in one click, open its chat, download an im
     }, null, { timeout: 20000 });
     await page.screenshot({ path: join(SHOTS, 'threads.png') });
     // Find a chat by title, and sort.
-    await page.getByRole('button', { name: '← All series' }).click();
+    await page.getByRole('button', { name: '← All threads' }).click();
     await tid(page, 'gc-series-search').fill('album');
     assert.equal(await tid(page, 'gc-series-row').count(), 1);
     await tid(page, 'gc-series-search').fill('');

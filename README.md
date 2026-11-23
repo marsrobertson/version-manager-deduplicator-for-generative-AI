@@ -25,7 +25,7 @@ The storage page lets you delete one file at a time. With 10,000 images, that is
 3. **Suggest.** For each suggestion it shows the number of files and the space it frees:
    - **Extra copies:** the same file stored more than once. One copy of each is kept.
    - **All references:** every uploaded image. Documents such as PDFs are never included.
-   - **Series:** your generations grouped by chat, oldest first, as a version history. Star the keepers, click the fails, or press "reject all not starred".
+   - **Threads:** your images grouped by chat, oldest first, as a version history. Every image has **↗ chat** (opens the chat it came from) and **⬇ save** (full-size download); every thread row has **Open chat ↗**. Search by chat title or prompt. Star the keepers, click the fails, or press "reject all not starred".
    - **Look-alikes:** near-identical images, e.g. two re-rolls that barely differ, or a generation and its re-upload.
 4. **Delete, carefully.** Nothing is deleted without your confirmation:
    - Dry run is on by default.
@@ -57,7 +57,7 @@ Untick **Dry run** and press **Autopilot: remove copies & references**. It runs 
 4. Deletes one test file and re-reads the storage listing to prove it is gone. If it is still listed, autopilot pauses.
 5. Deletes the rest, then rescans and reports the space freed.
 
-Autopilot **never deletes generations**. Culling generations needs your judgement, so it stays manual (Series tab). With dry run on, autopilot only simulates.
+Autopilot **never deletes generations**. Culling generations needs your judgement, so it stays manual (Threads tab). With dry run on, autopilot only simulates.
 
 ## Install
 
